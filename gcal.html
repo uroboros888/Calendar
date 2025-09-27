@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Yacht Calendar — Viewer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html,body{height:100%}
+    .tn-nums{font-variant-numeric: tabular-nums;}
+  </style>
+</head>
+<body class="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100 text-gray-900">
+  <div id="app" class="mx-auto px-4 py-6 max-w-5xl"></div>
+
+  <script>
+  const STORAGE_KEY='yachtCalendarConfig';
+  const TZ='Asia/Dubai'; // fixed per requirements
+  const fmt = (d, opts={}) => new Intl.DateTimeFormat(undefined, {...opts, timeZone: TZ}).format(d);
+
+  const app=document.getElementById('app');
+
+  function loadConfig(){ try{ const raw=localStorage.getItem(STORAGE_KEY); return raw? JSON.parse(raw) : null; }catch(e){ return null; } }
+  function pad2(n){ return String(n).padStart(2,'0'); }
+
+  // Build YYYY-MM-DD date in TZ for today + offsetDays
+  function zonedDateParts(date, timeZone){
+    const parts = new Intl.DateTimeFormat('en-CA',{timeZone,year:'numeric',month:'2-digit',day:'2-digit',weekday:'short',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(date);
+    const map={}; parts.forEach(p=> map[p.type]=p.value);
+    return { y: Number(map.year), m: Number(map.month), d: Number(map.day), wd: map.weekday };
+  }
+  function isoDateInTZ(date, timeZone){ const p=zonedDateParts(date,timeZone); return `${p.y}-${pad2(p.m)}-${pad2(p.d)}`; }
+
+  function startOfISOWeekInTZ(date, timeZone){
+    // compute weekday in TZ (Mon..Sun) using mapping from short label
+    const wdLabel = new Intl.DateTimeFormat('en-US',{timeZone, weekday:'short'}).format(date); // e.g., Mon
+    const idx = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].indexOf(wdLabel);
+    const daysBack = (idx===-1?0:idx); // Mon=0..Sun=6
+    const d = new Date(date);
+    d.setUTCDate(d.getUTCDate()-daysBack);
+    return d;
+  }
+
+  function addDays(d, n){ const x=new Date(d); x.setUTCDate(x.getUTCDate()+n); return x; }
+
+  // Helpers to create Date from a Dubai calendar day + HH:MM (no DST in Dubai, offset +04:00)
+  function dubaiSlotDate(ymd, hm){ return new Date(`${ymd}T${hm}:00+04:00`); }
+  function addMinutes(date, mins){ const d=new Date(date); d.setMinutes(d.getMinutes()+mins); return d; }
+
+  // Demo data generator (deterministic with seed)
+  function random(seed){ return ()=> (seed = (seed*9301 + 49297) % 233280) / 233280; }
+  function demoEventsForWeek(weekStartInTz, seed){
+    const out=[]; const rnd=random(seed);
+    for(let d=0; d<7; d++){
+      const ymd = isoDateInTZ(addDays(weekStartInTz,d), TZ);
+      let cursor = dubaiSlotDate(ymd, '08:00');
+      const dayEnd = dubaiSlotDate(ymd, '23:00');
+      const n = 1 + Math.floor(rnd()*3);
+      for(let i=0;i<n;i++){
+        const startOffset = (Math.floor(rnd()*9))*30; // 0..240m
+        const dur = (2 + Math.floor(rnd()*9))*30; // 60..300m
+        const start = addMinutes(cursor, startOffset);
+        let end = addMinutes(start, dur); if(end>dayEnd) end=dayEnd;
+        cursor = addMinutes(end, (Math.floor(rnd()*5))*30);
+        out.push({start, end});
+      }
+    }
+    return out;
+  }
+
+  function makePriceFn(pr){
+    const round=(v)=> pr.roundTo>0? Math.round(v/pr.roundTo)*pr.roundTo : v;
+    const bandMult=(dt)=>{ const h=new Date(dt).getHours(); let m=(h>=8&&h<12)?pr.bands.morning:(h<17?pr.bands.day:(h<20?pr.bands.sunset:pr.bands.evening)); if(new Date(dt).getDay()===5 && h>=17 && h<20) m*=pr.friSunset; return m; };
+    return (base,dt)=> round(base * bandMult(dt));
+  }
+
+  async function fetchJson(url, timeoutMs=15000){
+    const ctrl=new AbortController(); const t=setTimeout(()=>ctrl.abort(), timeoutMs);
+    try{ const res= await fetch(url,{signal:ctrl.signal}); if(!res.ok) throw new Error(`HTTP ${res.status}`); return await res.json(); }
+    finally{ clearTimeout(t); }
+  }
+
+  function cacheGet(key, ttlMs){ try{ const raw=localStorage.getItem(key); if(!raw) return null; const obj=JSON.parse(raw); if(Date.now()-obj.t>ttlMs) return null; return obj.v; }catch{ return null; } }
+  function cacheSet(key, v){ try{ localStorage.setItem(key, JSON.stringify({t:Date.now(), v})); }catch{} }
+
+  let weekOffset=0; // 0=this week in Dubai TZ
+
+  async function render(){
+    const cfg=loadConfig();
+    if(!cfg){
+      app.innerHTML = `<div class="max-w-md mx-auto text-center bg-white rounded-2xl shadow p-6">
+        <h2 class="font-semibold text-lg mb-2">No settings found</h2>
+        <p class="text-sm text-gray-600 mb-4">Open admin and save configuration.</p>
+        <a href="admin.html" class="px-3 py-2 rounded-lg bg-indigo-600 text-white">Open Admin</a>
+      </div>`; return;
+    }
+
+    const weekStartInTz = addDays(startOfISOWeekInTZ(new Date(), TZ), 7*weekOffset);
+    const startYMD = isoDateInTZ(weekStartInTz, TZ);
+    const endYMD = isoDateInTZ(addDays(weekStartInTz, 6), TZ);
+
+    const priceAt = makePriceFn(cfg.pricing);
+
+    const key=`yachtCalendarCache|${cfg.endpointUrl}|${startYMD}`;
+    let data=null; let labelPrefix='';
+    if(cfg.useDemo){
+      // synthesize demo events for boats using seeds
+      const boats = (cfg.boats||[]).map((b,idx)=> ({ id:b.id, name:b.name, events: demoEventsForWeek(weekStartInTz, idx===0? (cfg.demoSeedA||42) : (cfg.demoSeedB||99)) }));
+      data = { tz: TZ, boats };
+      labelPrefix='demo • ';
+    } else {
+      data = cacheGet(key, 10*60*1000);
+      let usedCache=false;
+      if(!data){
+        app.innerHTML = `<div class="text-center text-sm text-gray-600">Loading ${startYMD}…</div>`;
+        try{
+          const url = `${cfg.endpointUrl}?start=${startYMD}&end=${endYMD}&tz=${encodeURIComponent(TZ)}`;
+          data = await fetchJson(url);
+          cacheSet(key, data);
+        }catch(err){
+          const cachedAny = cacheGet(key, Infinity);
+          if(cachedAny){ data=cachedAny; usedCache=true; }
+          else { app.innerHTML = `<div class=\"max-w-md mx-auto text-center bg-white rounded-2xl shadow p-6\">\n          <h2 class=\"font-semibold text-lg mb-2\">Load failed</h2>\n          <div class=\"text-sm text-gray-600\">${String(err.message||err)}</div>\n          <div class=\"mt-4\"><button class=\"px-3 py-2 rounded-lg bg-indigo-600 text-white\" onclick=\"location.reload()\">Retry</button>\n          <a class=\"ml-2 px-3 py-2 rounded-lg bg-white border\" href=\"admin.html\">Admin</a></div></div>`; return; }
+        }
+      }
+      labelPrefix = usedCache? 'cached • ' : '';
+    }
+
+    const boatsCfgById = Object.fromEntries(cfg.boats.map(b=> [b.id, b]));
+    const boats = (data.boats || []).filter(b=> boatsCfgById[b.id]);
+
+    function statusFor(events, slotStart, slotEnd){
+      for(const ev of events){ const s=new Date(ev.start), e=new Date(ev.end); if(s < slotEnd && e > slotStart) return 'busy'; }
+      return 'free';
+    }
+
+    function HourlyDay(dayYMD){
+      const rows=[]; // array of {label, cells:[{id, status, price}]}
+      const {open, close, slotMins}=cfg;
+      const [oh,om]=open.split(':').map(Number); const [ch,cm]=close.split(':').map(Number);
+      const openM=oh*60+om, closeM=ch*60+cm, step=slotMins;
+      for(let m=openM; m+step<=closeM; m+=step){
+        const hh=Math.floor(m/60), mm=m%60; const nextH=Math.floor((m+step)/60), nextM=(m+step)%60;
+        const h12=((hh+11)%12)+1; const ap = hh<12 ? 'AM':'PM';
+        const label = mm===0 ? `${h12} ${ap}` : `${h12}:${String(mm).padStart(2,'0')} ${ap}`;
+        const slotStart=dubaiSlotDate(dayYMD, `${pad2(hh)}:${pad2(mm)}`);
+        const slotEnd=dubaiSlotDate(dayYMD, `${pad2(nextH)}:${pad2(nextM)}`);
+        const cells = boats.map(b=>{
+          const st = statusFor(b.events||[], slotStart, slotEnd);
+          const base = boatsCfgById[b.id].baseRate;
+          const price = st==='free'? priceAt(base, slotStart) : null;
+          return {id:b.id, status: st, price};
+        });
+        rows.push({label, cells});
+      }
+      return rows;
+    }
+
+    const dayList = Array.from({length:7},(_,i)=> addDays(weekStartInTz,i));
+    const dayYMD = dayList.map(d=> isoDateInTZ(d, TZ));
+
+    function DayHeader(d){ const isToday = new Intl.DateTimeFormat('en-CA',{timeZone:TZ,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date())===isoDateInTZ(d,TZ); return `<div class="text-sm font-medium ${isToday? 'text-blue-700':'text-gray-700'}">${fmt(d,{weekday:'short'})} <span class="opacity-70">${fmt(d,{day:'2-digit',month:'short'})}</span></div>`; }
+
+    const weekEnd = addDays(weekStartInTz,6);
+    const header = `
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h1 class="font-semibold tracking-tight text-2xl">Yacht Availability</h1>
+          <p class="text-sm text-gray-600">Intervals • ${labelPrefix}${fmt(weekStartInTz,{month:'short',day:'2-digit'})} — ${fmt(weekEnd,{month:'short',day:'2-digit'})} • ${TZ}</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button class="px-3 py-2 rounded-xl bg-white shadow" onclick="weekOffset--; render()">←</button>
+          <button class="px-3 py-2 rounded-xl bg-white shadow" onclick="weekOffset++; render()">→</button>
+        </div>
+      </div>`;
+
+    const content = dayYMD.map((ymd,i)=>{
+      const rows = HourlyDay(ymd);
+      const boatNames = boats.map(b=> boatsCfgById[b.id].name || b.id);
+      return `
+        <div class="bg-white rounded-2xl shadow p-4 mb-4">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2">${DayHeader(dayList[i])}</div>
+          </div>
+          <div class="grid" style="grid-template-columns:90px 1fr 1fr; gap:12px; align-items:center; grid-auto-rows:2.25rem;">
+            <div></div>
+            ${boatNames.map(n=> `<div class=\"text-xs font-medium text-gray-500 text-center pb-1\">${n}</div>`).join('')}
+            ${rows.map(r=> `
+              <div class="text-sm text-gray-700 tn-nums text-right pr-3">${r.label}</div>
+              ${r.cells.map(c=> c.status==='free' ? `<div class=\"w-full h-9 rounded-lg bg-green-100 text-green-900 text-xs flex items-center justify-center\">${c.price} AED</div>` : (c.status==='busy'? `<div class=\"w-full h-9 rounded-lg bg-red-300/80 text-[11px] text-red-900 flex items-center justify-center\">Busy</div>` : `<div class=\"w-full h-9 text-xs text-gray-300 flex items-center justify-center\">—</div>`)).join('')}
+            `).join('')}
+          </div>
+        </div>`;
+    }).join('');
+
+    app.innerHTML = header + content;
+  }
+
+  render();
+  </script>
+</body>
+</html>

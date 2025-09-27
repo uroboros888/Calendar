@@ -52,10 +52,14 @@
 
   async function loadConfig(){
     let cfg={...DEFAULT_CONFIG};
-    // try static config.json
-    try{ const res=await fetch('config.json',{cache:'no-store'}); if(res.ok){ const fileCfg=await res.json(); cfg=mergeConfig(cfg,fileCfg); } }catch{}
+    // try static config.json (skip when running from file:// to avoid CORS noise)
+    if(location.protocol!=='file:'){
+      try{ const res=await fetch('config.json',{cache:'no-store'}); if(res.ok){ const fileCfg=await res.json(); cfg=mergeConfig(cfg,fileCfg); } }catch{}
+    }
     // apply local overrides
     try{ const raw=localStorage.getItem(STORAGE_KEY); if(raw){ const local=JSON.parse(raw); cfg=mergeConfig(cfg,local); } }catch{}
+    // ensure endpoint fallback if empty override
+    if(!cfg.endpointUrl){ cfg.endpointUrl = DEFAULT_ENDPOINT; }
     return cfg;
   }
   function pad2(n){ return String(n).padStart(2,'0'); }

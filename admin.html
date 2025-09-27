@@ -121,6 +121,7 @@
         <div class="flex flex-wrap gap-3">
           <button id="saveBtn" class="px-4 py-2 rounded-lg bg-indigo-600 text-white">Save</button>
           <button id="resetBtn" class="px-4 py-2 rounded-lg bg-white border">Reset to defaults</button>
+          <button id="clearLocalBtn" class="px-4 py-2 rounded-lg bg-white border">Reset to config.json</button>
           <button id="exportBtn" class="px-4 py-2 rounded-lg bg-white border">Export JSON</button>
           <label class="px-4 py-2 rounded-lg bg-white border cursor-pointer">Import JSON<input id="importInput" type="file" accept="application/json" class="hidden"></label>
           <a href="gcal.html" class="ml-auto px-4 py-2 rounded-lg bg-green-600 text-white">Open Viewer</a>
@@ -153,6 +154,14 @@
       toast('Saved');
     };
     document.getElementById('resetBtn').onclick = () => { state = {...DEFAULT_CONFIG}; render(); toast('Reset'); };
+    document.getElementById('clearLocalBtn').onclick = async () => {
+      try{ localStorage.removeItem(STORAGE_KEY); }catch{}
+      try{
+        const res = await fetch('config.json', {cache:'no-store'});
+        if(res.ok){ state = { ...DEFAULT_CONFIG, ...(await res.json()) }; render(); toast('Loaded from config.json'); return; }
+      }catch{}
+      state = { ...DEFAULT_CONFIG }; render(); toast('Cleared local overrides');
+    };
     document.getElementById('exportBtn').onclick = () => {
       const blob = new Blob([JSON.stringify(state,null,2)], {type:'application/json'});
       const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='yacht-config.json'; a.click();

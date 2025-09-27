@@ -10,6 +10,8 @@
     html,body{height:100%}
     /* Prevent text selection during fast nav taps */
     .no-select{user-select:none}
+    /* Tabular numbers for aligned time column */
+    .tn-nums{font-variant-numeric: tabular-nums;}
   </style>
 </head>
 <body class="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100 text-gray-900">
@@ -483,8 +485,8 @@
       return `<div class="bg-white rounded-2xl shadow p-4">
         <div class="flex items-center justify-between mb-3"><div class="flex items-center gap-2">${DayHeader(day)} ${state.dayRate>0? `<span class=\"text-[11px] text-gray-600 bg-gray-100 rounded px-2 py-0.5\">Day: ${state.dayRate} AED</span>`:''}</div></div>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-          ${Col('Yacht A', aItem)}
-          ${Col('Yacht B', bItem)}
+          ${Col('Van Dutch 40', aItem)}
+          ${Col('Monte Carlo 60', bItem)}
         </div>
       </div>`;
     };
@@ -530,7 +532,7 @@
       return `<div class="bg-white rounded-2xl shadow p-4">
         <div class="flex items-center justify-between mb-3"><div class="flex items-center gap-2">${DayHeader(day)}</div></div>
         <div class="grid" style="grid-template-columns:120px 1fr 1fr; gap:8px; align-items:center;">
-          <div></div><div class="text-xs text-gray-500">Yacht A</div><div class="text-xs text-gray-500">Yacht B</div>
+          <div></div><div class="text-xs text-gray-500">Van Dutch 40</div><div class="text-xs text-gray-500">Monte Carlo 60</div>
           ${rows.map(r=>{
             const cell=(state)=>{
               if(state==='free' && (state.mode==='both' || state.mode==='free')) return `<div class=\"rounded-lg bg-green-100 text-green-900 text-xs px-2 py-1 text-center\">${r.price} AED</div>`;
@@ -583,23 +585,23 @@
         const dtEnd=new Date(day); dtEnd.setHours(nextH,nextM,0,0);
         rows.push({lbl, dt, stA: statusFor(rawDayA, dt, dtEnd), stB: statusFor(rawDayB, dt, dtEnd)});
       }
-      const header=`<div></div><div class="text-xs text-gray-500">Yacht A</div><div class="text-xs text-gray-500">Yacht B</div>`;
+      const header=`<div></div><div class="text-xs font-medium text-gray-500 text-center pb-1">Van Dutch 40</div><div class="text-xs font-medium text-gray-500 text-center pb-1">Monte Carlo 60</div>`;
       const rowsHtml=rows.map(r=>{
         const cell=(st)=>{
-          if(st==='free' && (state.mode==='both' || state.mode==='free')) return `<div class="w-full h-8 rounded-lg bg-green-100 text-green-900 text-xs flex items-center justify-center">${pricePerHour(r.dt)} AED</div>`;
-          if(st==='busy' && (state.mode==='both' || state.mode==='busy')) return `<div class="w-full h-8 rounded-lg bg-red-300/80 text-[11px] text-red-900 flex items-center justify-center">Busy</div>`;
-          if(st==='none') return `<div class="w-full h-8 text-xs text-gray-300 flex items-center justify-center">—</div>`;
+          if(st==='free' && (state.mode==='both' || state.mode==='free')) return `<div class="w-full h-9 rounded-lg bg-green-100 text-green-900 text-xs flex items-center justify-center">${pricePerHour(r.dt)} AED</div>`;
+          if(st==='busy' && (state.mode==='both' || state.mode==='busy')) return `<div class="w-full h-9 rounded-lg bg-red-300/80 text-[11px] text-red-900 flex items-center justify-center">Busy</div>`;
+          if(st==='none') return `<div class="w-full h-9 text-xs text-gray-300 flex items-center justify-center">—</div>`;
           return '';
         };
         return `
-          <div class="text-sm text-gray-700">${r.lbl}</div>
+          <div class="text-sm text-gray-700 tn-nums text-right pr-3">${r.lbl}</div>
           ${cell(r.stA)}
           ${cell(r.stB)}
         `;
       }).join('');
       return `<div class="bg-white rounded-2xl shadow p-4">
         <div class="flex items-center justify-between mb-3"><div class="flex items-center gap-2">${DayHeader(day)}</div></div>
-        <div class="grid" style="grid-template-columns:120px 1fr 1fr; gap:8px; align-items:center;">
+        <div class="grid" style="grid-template-columns:90px 1fr 1fr; gap:12px; align-items:center; grid-auto-rows:2.25rem;">
           ${header}
           ${rowsHtml}
         </div>

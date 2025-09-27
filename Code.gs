@@ -47,9 +47,11 @@ function doGet(e) {
       out.boats.push({ id: b.id, name: b.name || b.id, events: events });
     });
 
-    return json_(out);
+    var cb = e && e.parameter && e.parameter.callback;
+    return json_(out, cb);
   } catch (err) {
-    return json_({ error: String((err && err.message) || err) });
+    var cb = e && e.parameter && e.parameter.callback;
+    return json_({ error: String((err && err.message) || err) }, cb);
   }
 }
 
@@ -107,9 +109,16 @@ function parseTZBoundary(ymd, tz, isStart) {
 }
 
 // JSON response wrapper
-function json_(obj) {
+function json_(obj, callback) {
+  var text = JSON.stringify(obj);
+  if (callback) {
+    // JSONP response to bypass CORS in frontends (e.g., GitHub Pages)
+    return ContentService
+      .createTextOutput(String(callback) + '(' + text + ');')
+      .setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
   return ContentService
-    .createTextOutput(JSON.stringify(obj))
+    .createTextOutput(text)
     .setMimeType(ContentService.MimeType.JSON);
 }
 
@@ -117,4 +126,3 @@ function json_(obj) {
 function doGet_ping() {
   return json_({ ok: true, now: new Date().toISOString() });
 }
-

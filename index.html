@@ -1,0 +1,657 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Yacht Availability — Single HTML</title>
+  <!-- Tailwind via CDN for quick demo; for prod you can self-host/build -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html,body{height:100%}
+    /* Prevent text selection during fast nav taps */
+    .no-select{user-select:none}
+  </style>
+</head>
+<body class="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100 text-gray-900">
+  <div id="app" class="mx-auto px-4 py-6 max-w-7xl"></div>
+
+  <script>
+  // ==================== Utilities ====================
+  const fmt = (d, opts={}) => new Intl.DateTimeFormat(undefined, opts).format(d);
+  const startOfISOWeek = (date)=>{ const d=new Date(date); const day=(d.getDay()+6)%7; d.setHours(0,0,0,0); d.setDate(d.getDate()-day); return d; };
+  const addDays = (date,days)=>{ const d=new Date(date); d.setDate(d.getDate()+days); return d; };
+  const addMinutes=(date,mins)=>{ const d=new Date(date); d.setMinutes(d.getMinutes()+mins); return d; };
+  const clamp=(a,lo,hi)=> Math.max(lo, Math.min(a,hi));
+  const minutesBetween=(a,b)=> Math.round((b-a)/60000);
+  const parseHM = (hm)=>{ const [h,m]=hm.split(":").map(Number); return {h,m,total:h*60+m}; };
+
+  // Demo bookings (deterministic-ish by seed)
+  function random(seed){ return ()=> (seed = (seed*9301 + 49297) % 233280) / 233280; }
+  function demoBookings(weekStart){
+    const out=[]; const rnd=random(42);
+    const titles=["Private Charter","Maintenance","Agent Hold","Cleaning","Skipper Break","VIP Charter"];
+    for(let d=0; d<7; d++){
+      const day=addDays(weekStart,d);
+      const n= 1 + Math.floor(rnd()*3); // 1..3
+      let cursor=new Date(day); cursor.setHours(8,0,0,0);
+      for(let i=0;i<n;i++){
+        const startOffset = (Math.floor(rnd()*9))*30; // 0..240m
+        const dur = (2 + Math.floor(rnd()*9))*30;     // 60..300m
+        const start = addMinutes(cursor,startOffset);
+        const endMax=new Date(day); endMax.setHours(23,0,0,0);
+        let end = addMinutes(start,dur); if(end>endMax) end=endMax;
+        cursor = addMinutes(end,(Math.floor(rnd()*5))*30);
+        out.push({start,end,title:titles[Math.floor(rnd()*titles.length)]});
+      }
+    }
+    return out;
+  }
+  // same as demoBookings, but with custom seed for multi-boat demos
+  function demoBookingsSeed(weekStart, seed){
+    const out=[]; const rnd=random(seed);
+    const titles=["Private Charter","Maintenance","Agent Hold","Cleaning","Skipper Break","VIP Charter"];
+    for(let d=0; d<7; d++){
+      const day=addDays(weekStart,d);
+      const n= 1 + Math.floor(rnd()*3);
+      let cursor=new Date(day); cursor.setHours(8,0,0,0);
+      for(let i=0;i<n;i++){
+        const startOffset = (Math.floor(rnd()*9))*30;
+        const dur = (2 + Math.floor(rnd()*9))*30;
+        const start = addMinutes(cursor,startOffset);
+        const endMax=new Date(day); endMax.setHours(23,0,0,0);
+        let end = addMinutes(start,dur); if(end>endMax) end=endMax;
+        cursor = addMinutes(end,(Math.floor(rnd()*5))*30);
+        out.push({start,end,title:titles[Math.floor(rnd()*titles.length)]});
+      }
+    }
+    return out;
+  }
+
+  function computeDailyFreeBusy(weekStart, bookings, dayOpen="08:00", dayClose="23:00"){ 
+    const {h:oh,m:om}=parseHM(dayOpen); const {h:ch,m:cm}=parseHM(dayClose);
+    const out=Array.from({length:7},(_,d)=>({day:addDays(weekStart,d), free:[], busy:[]}));
+    for(let d=0; d<7; d++){
+      const dayStart=new Date(addDays(weekStart,d)); dayStart.setHours(oh,om,0,0);
+      const dayEnd=new Date(addDays(weekStart,d)); dayEnd.setHours(ch,cm,0,0);
+      const dayBookings= bookings.filter(b=> b.start<dayEnd && b.end>dayStart)
+        .map(b=>({start:new Date(Math.max(b.start,dayStart)), end:new Date(Math.min(b.end,dayEnd)), title:b.title}))
+        .sort((a,b)=> a.start-b.start);
+      const merged=[]; // merge overlaps
+      for(const bk of dayBookings){
+        if(!merged.length || bk.start>merged[merged.length-1].end){ merged.push({...bk}); }
+        else { merged[merged.length-1].end = new Date(Math.max(merged[merged.length-1].end,bk.end)); }
+      }
+      out[d].busy=merged;
+      let cursor=dayStart; for(const bk of merged){ if(bk.start>cursor) out[d].free.push({start:cursor,end:bk.start}); cursor=new Date(Math.max(cursor,bk.end)); }
+      if(cursor<dayEnd) out[d].free.push({start:cursor,end:dayEnd});
+    }
+    return out;
+  }
+  const filterFreeByMin=(days,minMinutes)=> days.map(d=>({day:d.day, busy:d.busy, free:d.free.filter(f=> minutesBetween(f.start,f.end)>=minMinutes)}));
+
+  // Pricing helpers
+  function makePriceFn({baseRate, roundTo, mMorning, mDay, mSunset, mEvening, mFriSunset}){
+    const round=(v)=> roundTo>0 ? Math.round(v/roundTo)*roundTo : v;
+    const bandMult=(dt)=>{ const h=dt.getHours(); let m=(h>=8&&h<12)?mMorning:(h<17?mDay:(h<20?mSunset:mEvening)); if(dt.getDay()===5 && h>=17 && h<20) m*=mFriSunset; return m; };
+    return (dt)=> round(baseRate * bandMult(dt));
+  }
+
+  // ==================== State ====================
+  const state = {
+    weekOffset: 0,
+    slotMins: 60,
+    open: "08:00",
+    close: "23:00",
+    mode: "both", // both|busy|free
+    minFreeHours: 2,
+    isMobile: true,
+    // pricing
+    baseRate: 800,
+    roundTo: 50,
+    mMorning: 0.9,
+    mDay: 1.0,
+    mSunset: 1.2,
+    mEvening: 1.0,
+    mFriSunset: 1.5,
+    dayRate: 0,
+    // view
+    view: "ClassicBanded", // Grid|Banded|BandPrice|Classic|ClassicBanded
+  };
+
+  function getWeekStart(){ return addDays(startOfISOWeek(new Date()), 7*state.weekOffset); }
+  function getPricePerHour(){ return makePriceFn(state); }
+
+  // Derived data
+  function getData(){
+    const weekStart=getWeekStart();
+    const bookings=demoBookings(weekStart);
+    const freeBusyRaw=computeDailyFreeBusy(weekStart, bookings, state.open, state.close);
+    const freeBusy=filterFreeByMin(freeBusyRaw, state.minFreeHours*60);
+    return {weekStart, bookings, freeBusy};
+  }
+
+  // ==================== Rendering ====================
+  const app=document.getElementById('app');
+
+  function render(){
+    const {weekStart, freeBusy}=getData();
+    const weekEnd=addDays(weekStart,6);
+    const tz=Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const views=["Grid","Banded","BandPrice","ClassicBanded","Classic","Intervals"];
+
+    app.innerHTML = `
+      <div class="${state.isMobile? 'max-w-md' : ''}">
+        <header class="flex items-center justify-between mb-4">
+          <div>
+            <h1 class="font-semibold tracking-tight ${state.isMobile? 'text-xl' : 'text-2xl md:text-3xl'}">Yacht Availability</h1>
+            <p class="text-sm text-gray-600">Variant: ${state.view} • read‑only • pricing per slot</p>
+          </div>
+          <span class="text-xs text-gray-500">Timezone: ${tz}</span>
+        </header>
+
+        ${Toolbar({weekStart,weekEnd,views})}
+
+        ${
+          state.view==='Grid' ? GridView({weekStart, freeBusy}) :
+          state.view==='Banded' ? BandedView({weekStart, freeBusy}) :
+          state.view==='BandPrice' ? BandPriceView({weekStart, freeBusy}) :
+          state.view==='ClassicBanded' ? ClassicBandedView({weekStart, freeBusy}) :
+          state.view==='Intervals' ? IntervalsView({weekStart, freeBusy}) :
+          ClassicView({weekStart, freeBusy})
+        }
+
+        <footer class="mt-6 text-xs text-gray-500 flex flex-col gap-1">
+          <div class="flex flex-wrap items-center gap-3">
+            <span class="inline-block w-3 h-3 rounded bg-green-300/80"></span> Free
+            <span class="inline-block w-3 h-3 rounded bg-red-400/80"></span> Busy
+            <span class="inline-block w-3 h-3 rounded bg-gray-200"></span> Other
+          </div>
+          <div>Bands: Morning 08–12, Day 12–17, Sunset 17–20, Evening 20–23. Friday sunset has extra multiplier.</div>
+        </footer>
+      </div>
+    `;
+
+    bindToolbar();
+  }
+
+  // ==================== Components (template strings) ====================
+  function DayHeader(date){
+    const isToday = new Date().toDateString()=== new Date(date).toDateString();
+    return `<div class="text-sm font-medium ${isToday? 'text-blue-700':'text-gray-700'}">${fmt(date,{weekday:'short'})} <span class="opacity-70">${fmt(date,{day:'2-digit',month:'short'})}</span></div>`;
+  }
+
+  function Toolbar({weekStart, weekEnd, views}){
+    return `
+      <div class="flex flex-col gap-3 md:gap-4">
+        <div class="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+          <div class="flex items-center gap-2">
+            <button data-cmd="prev" class="px-3 py-2 rounded-xl bg-white shadow hover:shadow-md">←</button>
+            <div class="px-4 py-2 bg-white rounded-xl shadow text-sm">
+              <div class="font-medium">${fmt(weekStart,{month:'short',day:'2-digit'})} — ${fmt(weekEnd,{month:'short',day:'2-digit'})}</div>
+              <div class="text-xs opacity-70">Week of ${fmt(weekStart,{year:'numeric'})}</div>
+            </div>
+            <button data-cmd="next" class="px-3 py-2 rounded-xl bg-white shadow hover:shadow-md">→</button>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <label class="text-sm">Variant:</label>
+            <div class="flex gap-1 bg-white rounded-xl p-1 shadow overflow-x-auto">
+              ${views.map(v=> `<button data-view="${v}" class="px-3 py-1.5 rounded-lg text-sm whitespace-nowrap ${v===state.view? 'bg-gray-900 text-white':'hover:bg-gray-100'}">${v}</button>`).join('')}
+            </div>
+            <div class="h-6 w-px bg-gray-200"></div>
+            <label class="text-sm">Display:</label>
+            <div class="flex gap-1 bg-white rounded-xl p-1 shadow">
+              ${['both','busy','free'].map(m=> `<button data-mode="${m}" class="px-3 py-1.5 rounded-lg text-sm ${state.mode===m? (m==='busy'?'bg-red-600 text-white': m==='free'?'bg-green-700 text-white':'bg-indigo-600 text-white') : 'hover:bg-gray-100'}">${m[0].toUpperCase()+m.slice(1)}</button>`).join('')}
+            </div>
+            ${state.mode!=='busy' ? `
+              <div class="flex items-center gap-2">
+                <span class="text-sm">≥</span>
+                <select data-prop="minFreeHours" class="px-3 py-1.5 bg-white rounded-xl shadow text-sm">
+                  ${[1,2,3,4].map(h=> `<option value="${h}" ${state.minFreeHours===h?'selected':''}>${h}h</option>`).join('')}
+                </select>
+                <span class="text-xs text-gray-500">min free block</span>
+              </div>` : ''}
+            <div class="h-6 w-px bg-gray-200"></div>
+            <label class="text-sm">Slot:</label>
+            <select data-prop="slotMins" class="px-3 py-1.5 bg-white rounded-xl shadow text-sm">
+              ${[30,60,120].map(v=> `<option value="${v}" ${state.slotMins===v?'selected':''}>${v===30?'30m': v===60?'60m':'120m'}</option>`).join('')}
+            </select>
+            <div class="h-6 w-px bg-gray-200"></div>
+            <label class="text-sm">Hours:</label>
+            <input data-prop="open" value="${state.open}" class="w-20 px-2 py-1.5 bg-white rounded-xl shadow text-sm" />
+            <span class="text-xs opacity-70">–</span>
+            <input data-prop="close" value="${state.close}" class="w-20 px-2 py-1.5 bg-white rounded-xl shadow text-sm" />
+            <div class="h-6 w-px bg-gray-200"></div>
+            <label class="text-sm">Preview:</label>
+            <button data-cmd="toggleMobile" class="px-3 py-1.5 rounded-lg text-sm bg-white shadow ${state.isMobile? 'ring-2 ring-blue-500':''}">${state.isMobile? 'Mobile':'Desktop'}</button>
+          </div>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2 bg-white rounded-xl shadow p-3">
+          <span class="text-sm font-medium">Pricing:</span>
+          <span class="text-xs text-gray-500">AED/hour</span>
+          <label class="text-sm">Base</label>
+          <input data-prop="baseRate" type="number" value="${state.baseRate}" class="w-24 px-2 py-1.5 bg-gray-50 rounded-lg border" />
+          <label class="text-sm">Round</label>
+          <select data-prop="roundTo" class="px-2 py-1.5 bg-gray-50 rounded-lg border">
+            ${[0,25,50,100].map(v=> `<option value="${v}" ${state.roundTo===v?'selected':''}>${v===0?'None':v}</option>`).join('')}
+          </select>
+          <div class="h-6 w-px bg-gray-200"></div>
+          <span class="text-xs text-gray-500">Bands:</span>
+          ${[['mMorning','Morning'],['mDay','Day'],['mSunset','Sunset'],['mEvening','Evening'],['mFriSunset','Fri⟶Sunset']].map(([k,label])=> `
+            <label class="text-sm">${label}</label>
+            <input data-prop="${k}" type="number" step="0.1" value="${state[k]}" class="w-20 px-2 py-1.5 bg-gray-50 rounded-lg border" />
+          `).join('')}
+          <div class="h-6 w-px bg-gray-200"></div>
+          <label class="text-sm">Day rate</label>
+          <input data-prop="dayRate" type="number" value="${state.dayRate}" class="w-28 px-2 py-1.5 bg-gray-50 rounded-lg border" />
+        </div>
+      </div>
+    `;
+  }
+
+  function makeSlots(src, slotMins){
+    const chunks=[]; src.forEach(intv=>{ let s=new Date(intv.start); while(addMinutes(s,slotMins)<=intv.end){ const e=addMinutes(s,slotMins); chunks.push({start:s,end:e}); s=e; } }); return chunks;
+  }
+
+  function GridView({weekStart, freeBusy}){
+    const days=[0,1,2,3,4,5,6].map(i=> addDays(weekStart,i));
+    const pricePerHour=getPricePerHour();
+
+    const byDayFree=freeBusy.map(d=> makeSlots(d.free, state.slotMins));
+    const byDayBusy=freeBusy.map(d=> makeSlots(d.busy, state.slotMins));
+
+    if(state.isMobile){
+      return `
+      <div class="mt-4 space-y-3">
+        ${days.map((d,di)=> `
+          <div class="bg-white rounded-2xl shadow p-3">
+            <div class="flex items-center justify-between mb-2">
+              <div class="flex items-center gap-2">${DayHeader(d)} ${state.dayRate>0? `<span class=\"text-[11px] text-gray-600 bg-gray-100 rounded px-2 py-0.5\">Day rate: ${state.dayRate} AED</span>`:''}</div>
+              <span class="text-xs text-gray-500">${state.slotMins}m</span>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              ${((state.mode==='busy'||state.mode==='both')? byDayBusy[di]:[]).slice(0,80).map(s=> `
+                <span class="px-2 py-1 rounded-lg text-[11px] bg-red-200/90 text-red-900" title="${fmt(s.start,{hour:'2-digit',minute:'2-digit'})}–${fmt(s.end,{hour:'2-digit',minute:'2-digit'})}">${fmt(s.start,{hour:'2-digit',minute:'2-digit'})}</span>
+              `).join('')}
+              ${((state.mode==='free'||state.mode==='both')? byDayFree[di]:[]).slice(0,80).map(s=> `
+                <span class="px-2 py-1 rounded-lg text-[11px] bg-green-200/90 text-green-900 flex items-center gap-1" title="${fmt(s.start,{hour:'2-digit',minute:'2-digit'})}–${fmt(s.end,{hour:'2-digit',minute:'2-digit'})}">
+                  ${fmt(s.start,{hour:'2-digit',minute:'2-digit'})}
+                  <span class="text-[10px] bg-white/70 rounded px-1">${pricePerHour(s.start)} <span class="opacity-60">AED</span></span>
+                </span>
+              `).join('')}
+            </div>
+          </div>
+        `).join('')}
+      </div>`;
+    }
+
+    const {total:openM}=parseHM(state.open); const {total:closeM}=parseHM(state.close);
+    const totalMinutes=closeM-openM; const rows=Math.max(1, Math.ceil(totalMinutes/state.slotMins));
+
+    return `
+      <div class="mt-4 bg-white rounded-2xl shadow overflow-hidden">
+        <div class="grid" style="grid-template-columns:110px repeat(7, minmax(0,1fr))">
+          <div class="bg-gray-50 p-3 text-xs font-medium text-gray-500">Time</div>
+          ${days.map(d=> `<div class="bg-gray-50 p-3 border-l text-xs">${DayHeader(d)}</div>`).join('')}
+          ${Array.from({length:rows}).map((_,r)=>{
+            const mFromOpen=r*state.slotMins; const hh=Math.floor((openM+mFromOpen)/60); const mm=(openM+mFromOpen)%60; const label=`${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
+            return `
+              <div class="p-2 text-xs text-right pr-3 border-t bg-gray-50">${label}</div>
+              ${days.map((d,di)=>{
+                const matchBusy=(byDayBusy[di]||[]).some(s=> s.start.getHours()===hh && s.start.getMinutes()===mm);
+                const matchFree=(byDayFree[di]||[]).some(s=> s.start.getHours()===hh && s.start.getMinutes()===mm);
+                const cls= matchBusy? 'bg-red-50 hover:bg-red-100' : (matchFree? 'bg-green-50 hover:bg-green-100' : 'bg-white');
+                const dt=new Date(d); dt.setHours(hh,mm,0,0);
+                return `<div class="border-t border-l p-0.5 ${cls}" title="${matchBusy?'Busy':(matchFree?'Free':'')}">
+                  ${matchBusy? `<div class=\"h-6 rounded-lg text-[10px] flex items-center justify-center bg-red-300/80\">Busy</div>`:''}
+                  ${(!matchBusy && matchFree)? `<div class=\"h-6 rounded-lg text-[10px] flex items-center justify-center bg-green-200/80\">Free · ${pricePerHour(dt)} AED</div>`:''}
+                </div>`;
+              }).join('')}
+            `;
+          }).join('')}
+        </div>
+      </div>`;
+  }
+
+  function BandedView({weekStart, freeBusy}){
+    const days=[0,1,2,3,4,5,6].map(i=> addDays(weekStart,i));
+    const pricePerHour=getPricePerHour();
+    const band=(dt)=>{ const h=new Date(dt).getHours(); if(h>=8&&h<12) return 'Morning'; if(h<17) return 'Day'; if(h<20) return 'Sunset'; return 'Evening'; };
+    const byDayFree=freeBusy.map(d=> makeSlots(d.free, state.slotMins));
+    const byDayBusy=freeBusy.map(d=> makeSlots(d.busy, state.slotMins));
+    const bandOrder=['Morning','Day','Sunset','Evening'];
+
+    function DayCol(d,di){
+      const chipsFree=(state.mode==='free'||state.mode==='both')? byDayFree[di]:[];
+      const chipsBusy=(state.mode==='busy'||state.mode==='both')? byDayBusy[di]:[];
+      const gFree={Morning:[],Day:[],Sunset:[],Evening:[]}; const gBusy={...gFree};
+      chipsFree.forEach(s=> gFree[band(s.start)].push(s)); chipsBusy.forEach(s=> gBusy[band(s.start)].push(s));
+      const head = `<div class="flex items-center justify-between mb-2">${DayHeader(d)} ${state.dayRate>0? `<span class=\"text-[11px] text-gray-600 bg-gray-100 rounded px-2 py-0.5\">Day: ${state.dayRate} AED</span>`:''}</div>`;
+      if(state.isMobile){
+        return `<div class="bg-white rounded-2xl shadow p-3">${head}
+          ${bandOrder.map(b=> `
+            <div class="mb-2">
+              <div class="text-[12px] font-medium text-gray-700 mb-1">${b}</div>
+              <div class="flex flex-wrap gap-2">
+                ${gBusy[b].map(s=> `<span class=\"px-2 py-1 rounded-lg text-[11px] bg-red-200/90 text-red-900\">${fmt(s.start,{hour:'2-digit',minute:'2-digit'})}</span>`).join('')}
+                ${gFree[b].map(s=> `<span class=\"px-2 py-1 rounded-lg text-[11px] bg-green-200/90 text-green-900 flex items-center gap-1\">${fmt(s.start,{hour:'2-digit',minute:'2-digit'})}<span class=\"text-[10px] bg-white/70 rounded px-1\">${pricePerHour(s.start)} AED</span></span>`).join('')}
+                ${(gBusy[b].length===0 && gFree[b].length===0)? '<span class="text-[11px] text-gray-400">—</span>':''}
+              </div>
+            </div>`).join('')}
+        </div>`;
+      }
+      return `<div class="bg-white rounded-2xl shadow p-4">${head}
+        ${bandOrder.map(b=> `
+          <div class="mb-2">
+            <div class="text-[12px] font-medium text-gray-700 mb-1">${b}</div>
+            <div class="flex flex-wrap gap-2">
+              ${gBusy[b].map(s=> `<span class=\"px-2 py-1 rounded-lg text-[11px] bg-red-200/90 text-red-900\">${fmt(s.start,{hour:'2-digit',minute:'2-digit'})}</span>`).join('')}
+              ${gFree[b].map(s=> `<span class=\"px-2 py-1 rounded-lg text-[11px] bg-green-200/90 text-green-900 flex items-center gap-1\">${fmt(s.start,{hour:'2-digit',minute:'2-digit'})}<span class=\"text-[10px] bg-gray-50 rounded px-1\">${pricePerHour(s.start)} AED</span></span>`).join('')}
+              ${(gBusy[b].length===0 && gFree[b].length===0)? '<span class="text-[11px] text-gray-400">—</span>':''}
+            </div>
+          </div>`).join('')}
+      </div>`;
+    }
+
+    if(state.isMobile){
+      return `<div class="mt-4 space-y-3">${days.map((d,di)=> DayCol(d,di)).join('')}</div>`;
+    }
+    return `<div class="mt-4 grid md:grid-cols-2 lg:grid-cols-3 gap-4">${days.map((d,di)=> DayCol(d,di)).join('')}</div>`;
+  }
+
+  function BandPriceView({weekStart, freeBusy}){
+    const days=[0,1,2,3,4,5,6].map(i=> addDays(weekStart,i));
+    const pricePerHour=getPricePerHour();
+    const band=(dt)=>{ const h=new Date(dt).getHours(); if(h>=8&&h<12) return 'Morning'; if(h<17) return 'Day'; if(h<20) return 'Sunset'; return 'Evening'; };
+    const repHour={Morning:9, Day:13, Sunset:18, Evening:21};
+    const bandOrder=['Morning','Day','Sunset','Evening'];
+    const byDayFree=freeBusy.map(d=> makeSlots(d.free, state.slotMins));
+    const byDayBusy=freeBusy.map(d=> makeSlots(d.busy, state.slotMins));
+
+    const DayBlock=(day,di)=>{
+      const chipsFree=(state.mode==='free'||state.mode==='both')? byDayFree[di]:[];
+      const chipsBusy=(state.mode==='busy'||state.mode==='both')? byDayBusy[di]:[];
+      const gFree={Morning:[],Day:[],Sunset:[],Evening:[]}; const gBusy={...gFree};
+      chipsFree.forEach(s=> gFree[band(s.start)].push(s)); chipsBusy.forEach(s=> gBusy[band(s.start)].push(s));
+      return `<div class="bg-white rounded-2xl shadow p-3">
+        <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center gap-2">${DayHeader(day)} ${state.dayRate>0? `<span class=\"text-[11px] text-gray-600 bg-gray-100 rounded px-2 py-0.5\">Day rate: ${state.dayRate} AED</span>`:''}</div>
+        </div>
+        ${bandOrder.map(b=>{
+          const dt=new Date(day); dt.setHours(repHour[b],0,0,0); const bandPrice=pricePerHour(dt);
+          return `<div class="mb-2">
+            <div class="flex items-center justify-between mb-1">
+              <div class="text-[12px] font-medium text-gray-700">${b}</div>
+              <div class="text-[12px] text-gray-700 bg-gray-100 rounded px-2 py-0.5">${bandPrice} AED/h</div>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              ${(state.mode!=='busy')? gFree[b].map(s=> `<span class=\"px-2 py-1 rounded-lg text-[11px] bg-green-200/90 text-green-900\">${fmt(s.start,{hour:'2-digit',minute:'2-digit'})}</span>`).join(''):''}
+              ${(state.mode!=='free')? gBusy[b].map(s=> `<span class=\"px-2 py-1 rounded-lg text-[11px] bg-red-200/90 text-red-900\">${fmt(s.start,{hour:'2-digit',minute:'2-digit'})}</span>`).join(''):''}
+              ${(gFree[b].length===0 && gBusy[b].length===0)? '<span class="text-[11px] text-gray-400">—</span>':''}
+            </div>
+          </div>`;
+        }).join('')}
+      </div>`;
+    };
+
+    if(state.isMobile){ return `<div class="mt-4 space-y-3">${days.map((d,di)=> DayBlock(d,di)).join('')}</div>`; }
+    return `<div class="mt-4 grid md:grid-cols-2 lg:grid-cols-3 gap-4">${days.map((d,di)=> DayBlock(d,di)).join('')}</div>`;
+  }
+
+  function ClassicBandedView({weekStart, freeBusy}){
+    const days=[0,1,2,3,4,5,6].map(i=> addDays(weekStart,i));
+    const pricePerHour=getPricePerHour();
+    const band=(dt)=>{ const h=new Date(dt).getHours(); if(h>=8&&h<12) return 'Morning'; if(h<17) return 'Day'; if(h<20) return 'Sunset'; return 'Evening'; };
+    const bandOrder=['Morning','Day','Sunset','Evening'];
+    const durStr=(mins)=>{ const h=Math.floor(mins/60), m=mins%60; return h? `${h}h${m? ' '+m+'m':''}`: `${m}m`; };
+    const approxHourly=(s,e)=>{ const samples=[]; let cursor=new Date(s); cursor.setMinutes(0,0,0); while(cursor<=e){ samples.push(pricePerHour(cursor)); cursor=addMinutes(cursor,60); } if(samples.length===0) samples.push(pricePerHour(s)); return Math.round(samples.reduce((a,b)=>a+b,0)/samples.length); };
+
+    const DayBlock=(day, dItem)=>{
+        const rows=[];
+        dItem.busy.forEach(b=> rows.push({type:'busy',...b}));
+        dItem.free.forEach(f=> rows.push({type:'free',...f}));
+        rows.sort((a,b)=> a.start-b.start);
+
+        const g={Morning:[],Day:[],Sunset:[],Evening:[]};
+        rows.forEach(r=> { const b=band(r.start); if(g[b]) g[b].push(r); });
+
+        return `<div class="bg-white rounded-2xl shadow p-4">
+            <div class="flex items-center justify-between mb-3"><div class="flex items-center gap-2">${DayHeader(day)} ${state.dayRate>0? `<span class=\"text-[11px] text-gray-600 bg-gray-100 rounded px-2 py-0.5\">Day: ${state.dayRate} AED</span>`:''}</div></div>
+            <div class="space-y-3">
+                ${bandOrder.map(b=>{
+                    if(!g[b] || g[b].length===0) return '';
+                    return `
+                        <div>
+                            <div class="text-xs font-medium text-gray-600 mb-1">${b}</div>
+                            <div class="space-y-1">
+                                ${g[b].map(r=>{
+                                    const mins=minutesBetween(r.start,r.end);
+                                    if(r.type==='busy' && state.mode!=='free'){
+                                        return `<div class=\"flex items-center justify-between bg-red-50 border border-red-100 text-red-800 rounded-lg px-2 py-1 text-sm\"><span>${fmt(r.start,{hour:'2-digit',minute:'2-digit'})}–${fmt(r.end,{hour:'2-digit',minute:'2-digit'})}</span><span class=\"text-xs\">${durStr(mins)}</span></div>`;
+                                    }
+                                    if(r.type==='free' && state.mode!=='busy'){
+                                        const rate=approxHourly(r.start,r.end);
+                                        return `<div class=\"flex items-center justify-between bg-green-50 border border-green-100 text-green-900 rounded-lg px-2 py-1 text-sm\"><div class=\"flex items-center gap-2\"><span>${fmt(r.start,{hour:'2-digit',minute:'2-digit'})}–${fmt(r.end,{hour:'2-digit',minute:'2-digit'})}</span><span class=\"text-[11px] bg-white/70 rounded px-1\">≈ ${rate} AED/h</span></div><span class=\"text-xs\">${durStr(mins)}</span></div>`;
+                                    }
+                                    return '';
+                                }).join('')}
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+                ${rows.length===0? '<div class=\"text-sm text-gray-500\">Нет интервалов в рабочие часы</div>':''}
+            </div>
+        </div>`;
+    };
+
+    if(state.isMobile){ return `<div class="mt-4 space-y-3">${freeBusy.map((dItem,di)=> DayBlock(days[di], dItem)).join('')}</div>`; }
+    return `<div class="mt-4 grid md:grid-cols-2 lg:grid-cols-3 gap-4">${freeBusy.map((dItem,di)=> DayBlock(days[di], dItem)).join('')}</div>`;
+  }
+
+  function ClassicView({weekStart, freeBusy}){
+    const days=[0,1,2,3,4,5,6].map(i=> addDays(weekStart,i));
+    const pricePerHour=getPricePerHour();
+    const durStr=(mins)=>{ const h=Math.floor(mins/60), m=mins%60; return h? `${h}h${m? ' '+m+'m':''}`: `${m}m`; };
+    // Build second boat data using different seed
+    const bookingsB=demoBookingsSeed(weekStart, 99);
+    const rawB=computeDailyFreeBusy(weekStart, bookingsB, state.open, state.close);
+    const fbB=filterFreeByMin(rawB, state.minFreeHours*60);
+
+    const Col = (label, dItem)=>{
+      const hour=60;
+      const slotsBusy=makeSlots(dItem.busy, hour).map(s=> ({type:'busy', ...s}));
+      const slotsFree=makeSlots(dItem.free, hour).map(s=> ({type:'free', ...s}));
+      const rows=[...slotsBusy, ...slotsFree].sort((a,b)=> a.start-b.start);
+      return `<div class="space-y-1">
+        <div class="text-xs font-medium text-gray-600 mb-1">${label}</div>
+        ${rows.map(r=>{
+          const mins=minutesBetween(r.start,r.end);
+          if(r.type==='busy' && state.mode!=='free'){
+            return `<div class=\"flex items-center justify-between bg-red-50 border border-red-100 text-red-800 rounded-lg px-2 py-1 text-sm\"><span>${fmt(r.start,{hour:'2-digit',minute:'2-digit'})}–${fmt(r.end,{hour:'2-digit',minute:'2-digit'})}</span><span class=\"text-xs\">${durStr(mins)}</span></div>`;
+          }
+          if(r.type==='free' && state.mode!=='busy'){
+            const rate=pricePerHour(r.start);
+            return `<div class=\"flex items-center justify-between bg-green-50 border border-green-100 text-green-900 rounded-lg px-2 py-1 text-sm\"><div class=\"flex items-center gap-2\"><span>${fmt(r.start,{hour:'2-digit',minute:'2-digit'})}–${fmt(r.end,{hour:'2-digit',minute:'2-digit'})}</span><span class=\"text-[11px] bg-white/70 rounded px-1\">${rate} AED/h</span></div><span class=\"text-xs\">${durStr(mins)}</span></div>`;
+          }
+          return '';
+        }).join('')}
+        ${rows.length===0? '<div class="text-sm text-gray-500">Нет слотов</div>':''}
+      </div>`;
+    };
+
+    const DayBlock=(day, aItem, bItem)=>{
+      return `<div class="bg-white rounded-2xl shadow p-4">
+        <div class="flex items-center justify-between mb-3"><div class="flex items-center gap-2">${DayHeader(day)} ${state.dayRate>0? `<span class=\"text-[11px] text-gray-600 bg-gray-100 rounded px-2 py-0.5\">Day: ${state.dayRate} AED</span>`:''}</div></div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          ${Col('Yacht A', aItem)}
+          ${Col('Yacht B', bItem)}
+        </div>
+      </div>`;
+    };
+
+    if(state.isMobile){ return `<div class="mt-4 space-y-3">${freeBusy.map((aItem,di)=> DayBlock(days[di], aItem, fbB[di])).join('')}</div>`; }
+    return `<div class="mt-4 grid md:grid-cols-2 lg:grid-cols-3 gap-4">${freeBusy.map((aItem,di)=> DayBlock(days[di], aItem, fbB[di])).join('')}</div>`;
+  }
+
+  function HourlyPricesView({weekStart, freeBusy}){
+    const days=[0,1,2,3,4,5,6].map(i=> addDays(weekStart,i));
+    const pricePerHour=getPricePerHour();
+    const {total:openM}=parseHM(state.open); const {total:closeM}=parseHM(state.close);
+    const step=60; // fixed 1h rows
+
+    // Second boat data via different seed
+    const bookingsB=demoBookingsSeed(weekStart, 99);
+    const rawB=computeDailyFreeBusy(weekStart, bookingsB, state.open, state.close);
+    const fbB=filterFreeByMin(rawB, state.minFreeHours*60);
+
+    function makeMap(dItem){
+      const slotsFree=makeSlots(dItem.free, step);
+      const slotsBusy=makeSlots(dItem.busy, step);
+      const map=new Map();
+      const key=(dt)=> dt.getHours()+":"+dt.getMinutes();
+      slotsFree.forEach(s=> map.set(key(s.start), 'free'));
+      slotsBusy.forEach(s=> map.set(key(s.start), 'busy'));
+      return map;
+    }
+
+    function DayBlock(day, aItem, bItem){
+      const mapA=makeMap(aItem), mapB=makeMap(bItem);
+      const rows=[];
+      for(let m=openM; m+step<=closeM; m+=step){
+        const hh=Math.floor(m/60), mm=m%60; const nextH=Math.floor((m+step)/60), nextM=(m+step)%60;
+        const lbl=`${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}–${String(nextH).padStart(2,'0')}:${String(nextM).padStart(2,'0')}`;
+        const dt=new Date(day); dt.setHours(hh,mm,0,0);
+        const price=pricePerHour(dt);
+        const k=`${hh}:${mm}`;
+        const stA=mapA.get(k)||'none';
+        const stB=mapB.get(k)||'none';
+        rows.push({lbl, dt, price, stA, stB});
+      }
+      return `<div class="bg-white rounded-2xl shadow p-4">
+        <div class="flex items-center justify-between mb-3"><div class="flex items-center gap-2">${DayHeader(day)}</div></div>
+        <div class="grid" style="grid-template-columns:120px 1fr 1fr; gap:8px; align-items:center;">
+          <div></div><div class="text-xs text-gray-500">Yacht A</div><div class="text-xs text-gray-500">Yacht B</div>
+          ${rows.map(r=>{
+            const cell=(state)=>{
+              if(state==='free' && (state.mode==='both' || state.mode==='free')) return `<div class=\"rounded-lg bg-green-100 text-green-900 text-xs px-2 py-1 text-center\">${r.price} AED</div>`;
+              if(state==='busy' && (state.mode==='both' || state.mode==='busy')) return `<div class=\"rounded-lg bg-red-200/90 text-red-900 text-xs px-2 py-1 text-center\"></div>`;
+              if(state==='none') return `<div class=\"text-xs text-gray-300 text-center\">—</div>`;
+              return '';
+            };
+            return `<>
+              <div class="text-sm text-gray-700">${r.lbl}</div>
+              ${cell(r.stA)}
+              ${cell(r.stB)}
+            </>`;
+          }).join('')}
+        </div>
+      </div>`;
+    }
+
+    if(state.isMobile){ return `<div class="mt-4 space-y-3">${days.map(d=> DayBlock(d)).join('')}</div>`; }
+    return `<div class="mt-4 grid md:grid-cols-2 lg:grid-cols-3 gap-4">${days.map(d=> DayBlock(d)).join('')}</div>`;
+  }
+
+  function IntervalsView({weekStart, freeBusy}){
+    const days=[0,1,2,3,4,5,6].map(i=> addDays(weekStart,i));
+    const pricePerHour=getPricePerHour();
+    const {total:openM}=parseHM(state.open); const {total:closeM}=parseHM(state.close);
+    const step=60;
+
+    // Recompute RAW free/busy for accurate hourly overlap (no min-free filter)
+    const bookingsA=demoBookings(weekStart);
+    const rawA=computeDailyFreeBusy(weekStart, bookingsA, state.open, state.close);
+    const bookingsB=demoBookingsSeed(weekStart, 99);
+    const rawB=computeDailyFreeBusy(weekStart, bookingsB, state.open, state.close);
+
+    const statusFor=(rawDay, start, end)=>{
+      const overlaps=(a,b)=> a.start < end && a.end > start;
+      if(rawDay.busy.some(b=> overlaps(b))) return 'busy';
+      if(rawDay.free.some(f=> overlaps(f))) return 'free';
+      return 'none';
+    };
+
+    const DayBlock=(day, aItem, bItem)=>{
+      const rawDayA=rawA[days.findIndex(d=> d.toDateString()===day.toDateString())];
+      const rawDayB=rawB[days.findIndex(d=> d.toDateString()===day.toDateString())];
+      const rows=[];
+      for(let m=openM; m+step<=closeM; m+=step){
+        const hh=Math.floor(m/60), mm=m%60; const nextH=Math.floor((m+step)/60), nextM=(m+step)%60;
+        const h12=((hh+11)%12)+1; const ap=hh<12? 'AM':'PM';
+        const lbl = (mm===0) ? `${h12} ${ap}` : `${h12}:${String(mm).padStart(2,'0')} ${ap}`;
+        const dt=new Date(day); dt.setHours(hh,mm,0,0);
+        const dtEnd=new Date(day); dtEnd.setHours(nextH,nextM,0,0);
+        rows.push({lbl, dt, stA: statusFor(rawDayA, dt, dtEnd), stB: statusFor(rawDayB, dt, dtEnd)});
+      }
+      const header=`<div></div><div class="text-xs text-gray-500">Yacht A</div><div class="text-xs text-gray-500">Yacht B</div>`;
+      const rowsHtml=rows.map(r=>{
+        const cell=(st)=>{
+          if(st==='free' && (state.mode==='both' || state.mode==='free')) return `<div class="w-full h-8 rounded-lg bg-green-100 text-green-900 text-xs flex items-center justify-center">${pricePerHour(r.dt)} AED</div>`;
+          if(st==='busy' && (state.mode==='both' || state.mode==='busy')) return `<div class="w-full h-8 rounded-lg bg-red-300/80 text-[11px] text-red-900 flex items-center justify-center">Busy</div>`;
+          if(st==='none') return `<div class="w-full h-8 text-xs text-gray-300 flex items-center justify-center">—</div>`;
+          return '';
+        };
+        return `
+          <div class="text-sm text-gray-700">${r.lbl}</div>
+          ${cell(r.stA)}
+          ${cell(r.stB)}
+        `;
+      }).join('');
+      return `<div class="bg-white rounded-2xl shadow p-4">
+        <div class="flex items-center justify-between mb-3"><div class="flex items-center gap-2">${DayHeader(day)}</div></div>
+        <div class="grid" style="grid-template-columns:120px 1fr 1fr; gap:8px; align-items:center;">
+          ${header}
+          ${rowsHtml}
+        </div>
+      </div>`;
+    };
+
+    if(state.isMobile){ return `<div class="mt-4 space-y-3">${days.map(d=> DayBlock(d)).join('')}</div>`; }
+    return `<div class="mt-4 grid md:grid-cols-2 lg:grid-cols-3 gap-4">${days.map(d=> DayBlock(d)).join('')}</div>`;
+  }
+
+  // ==================== Events ====================
+  function bindToolbar(){
+    const root=app;
+    // week nav
+    root.querySelector('[data-cmd="prev"]').onclick=()=>{ state.weekOffset--; render(); };
+    root.querySelector('[data-cmd="next"]').onclick=()=>{ state.weekOffset++; render(); };
+    // view buttons
+    root.querySelectorAll('[data-view]').forEach(btn=> btn.onclick=()=>{ state.view=btn.getAttribute('data-view'); render(); });
+    // mode buttons
+    root.querySelectorAll('[data-mode]').forEach(btn=> btn.onclick=()=>{ state.mode=btn.getAttribute('data-mode'); render(); });
+    // prop inputs
+    root.querySelectorAll('[data-prop]').forEach(el=>{
+      const key=el.getAttribute('data-prop');
+      el.onchange=()=>{ const v= el.type==='number'? Number(el.value) : el.value; state[key] = isNaN(v)? el.value : v; render(); };
+    });
+    // toggle mobile
+    root.querySelector('[data-cmd="toggleMobile"]').onclick=()=>{ state.isMobile=!state.isMobile; render(); };
+  }
+
+  // ==================== Self-tests ====================
+  (function selfTests(){
+    const price=makePriceFn(state);
+    const a=new Date(2025,0,1,10,0,0), b=new Date(2025,0,1,12,30,0);
+    console.assert(minutesBetween(a,b)===150, 'minutesBetween should be 150');
+    const monMorning=price(new Date(2025,0,6,9,0,0));
+    const thuSunset=price(new Date(2025,0,9,18,0,0));
+    const friSunset=price(new Date(2025,0,10,18,0,0));
+    console.assert(monMorning===700 || monMorning===750, 'morning price ≈720 → 700/750');
+    console.assert(friSunset>thuSunset, 'Friday sunset must be > Thursday sunset');
+    const wedDay=price(new Date(2025,0,8,14,0,0)); const wedSunset=price(new Date(2025,0,8,18,0,0));
+    console.assert(wedSunset>=wedDay,'Sunset >= Day same day');
+    const thuDay=price(new Date(2025,0,9,15,0,0)); const friDay=price(new Date(2025,0,10,15,0,0));
+    console.assert(thuDay===friDay,'Fri daytime == Thu daytime');
+    // filterFreeByMin quick check
+    const week=startOfISOWeek(new Date(2025,0,6));
+    const days=computeDailyFreeBusy(week,[{start:new Date(2025,0,6,9,0,0), end:new Date(2025,0,6,10,0,0)}],"08:00","12:00");
+    const filtered=filterFreeByMin(days,120); const mon=filtered[0];
+    console.assert(mon.free.length===1 && minutesBetween(mon.free[0].start, mon.free[0].end)===120,'filterFreeByMin keeps 120m block');
+  })();
+
+  // Initial render
+  render();
+  </script>
+</body>
+</html>

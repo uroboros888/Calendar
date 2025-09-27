@@ -109,6 +109,10 @@
     const endYMD = isoDateInTZ(addDays(rangeStartInTz, 6), TZ);
 
     const priceAt = makePriceFn(cfg.pricing);
+    const isSmall = window.innerWidth < 420;
+    const gridTimeCol = isSmall? 64 : 90; // px
+    const gridGap = isSmall? 8 : 12;      // px
+    const rowH = isSmall? 28 : 36;        // px
 
     const key=`yachtCalendarCache|${cfg.endpointUrl}|${startYMD}`;
     let data=null; let labelPrefix='';
@@ -170,7 +174,7 @@
     const dayList = Array.from({length:7},(_,i)=> addDays(rangeStartInTz,i));
     const dayYMD = dayList.map(d=> isoDateInTZ(d, TZ));
 
-    function DayHeader(d){ const isToday = new Intl.DateTimeFormat('en-CA',{timeZone:TZ,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date())===isoDateInTZ(d,TZ); return `<div class="text-sm font-medium ${isToday? 'text-blue-700':'text-gray-700'}">${fmt(d,{weekday:'short'})} <span class="opacity-70">${fmt(d,{day:'2-digit',month:'short'})}</span></div>`; }
+    function DayHeader(d){ const isToday = new Intl.DateTimeFormat('en-CA',{timeZone:TZ,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date())===isoDateInTZ(d,TZ); return `<div class="${isSmall? 'text-xl' : 'text-base'} font-semibold ${isToday? 'text-blue-700':'text-gray-700'}">${fmt(d,{weekday:'short'})} <span class="opacity-70">${fmt(d,{day:'2-digit',month:'short'})}</span></div>`; }
 
     const weekEnd = addDays(rangeStartInTz,6);
     const header = `
@@ -188,22 +192,22 @@
       const rows = HourlyDay(ymd);
       const boatNames = boats.map(b=> boatsCfgById[b.id].name || b.id);
       return `
-        <div class="bg-white rounded-2xl shadow p-4 mb-4">
+        <div class="bg-white rounded-2xl shadow p-3 mb-3">
           <div class="flex items-center justify-between mb-3">
             <div class="flex items-center gap-2">${DayHeader(dayList[i])}</div>
           </div>
-          <div class="grid" style="grid-template-columns:90px 1fr 1fr; gap:12px; align-items:center; grid-auto-rows:2.25rem;">
+          <div class="grid" style="grid-template-columns:${gridTimeCol}px 1fr 1fr; gap:${gridGap}px; align-items:center; grid-auto-rows:${rowH}px;">
             <div></div>
-            ${boatNames.map(n=> `<div class=\"text-xs font-medium text-gray-500 text-center pb-1\">${n}</div>`).join('')}
+            ${boatNames.map(n=> `<div class=\"${isSmall?'text-sm':'text-sm'} font-semibold text-gray-700 text-center pb-1\">${n}</div>`).join('')}
             ${rows.map(r=> `
-              <div class="text-sm text-gray-700 tn-nums text-right pr-3">${r.label}</div>
-              ${r.cells.map(c=> c.status==='free' ? `<div class=\"w-full h-9 rounded-lg bg-green-100 text-green-900 text-xs flex items-center justify-center\">${c.price} AED</div>` : (c.status==='busy'? `<div class=\"w-full h-9 rounded-lg bg-red-300/80 text-[11px] text-red-900 flex items-center justify-center\">Busy</div>` : `<div class=\"w-full h-9 text-xs text-gray-300 flex items-center justify-center\">—</div>`)).join('')}
+              <div class="${isSmall?'text-base':'text-sm'} text-gray-700 tn-nums text-right ${isSmall?'pr-2':'pr-3'}">${r.label}</div>
+              ${r.cells.map(c=> c.status==='free' ? `<div class=\"w-full rounded-lg bg-green-100 text-green-900 ${isSmall?'text-[11px]':'text-xs'} flex items-center justify-center\" style=\"height:${rowH}px\">${c.price} AED</div>` : (c.status==='busy'? `<div class=\"w-full rounded-lg bg-red-300/80 text-[11px] text-red-900 flex items-center justify-center\" style=\"height:${rowH}px\">Busy</div>` : `<div class=\"w-full ${isSmall?'text-[11px]':'text-xs'} text-gray-300 flex items-center justify-center\" style=\"height:${rowH}px\">—</div>`)).join('')}
             `).join('')}
           </div>
         </div>`;
     }).join('');
 
-    app.innerHTML = header + `<div class="mx-auto max-w-4xl">` + content + `</div>`;
+    app.innerHTML = header + `<div class="mx-auto ${isSmall?'max-w-sm':'max-w-4xl'}">` + content + `</div>`;
   }
 
   function forceRefresh(){

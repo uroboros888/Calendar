@@ -20,7 +20,44 @@
 
   const app=document.getElementById('app');
 
-  function loadConfig(){ try{ const raw=localStorage.getItem(STORAGE_KEY); return raw? JSON.parse(raw) : null; }catch(e){ return null; } }
+  // Defaults including a hardcoded fallback endpoint
+  const DEFAULT_ENDPOINT = 'https://script.google.com/macros/s/AKfycbwKj5564y7ek86sec9762IhmxI5dDTjH4mXI10RSAn4A_WCuDCpj13E4sWC1fFhVyxNYA/exec';
+  const DEFAULT_CONFIG = {
+    endpointUrl: DEFAULT_ENDPOINT,
+    open: '08:00',
+    close: '23:00',
+    slotMins: 60,
+    useDemo: false,
+    demoSeedA: 42,
+    demoSeedB: 99,
+    boats: [
+      { id:'A', name:'Yacht A', baseRate:800 },
+      { id:'B', name:'Yacht B', baseRate:1400 },
+    ],
+    pricing: { roundTo:50, bands:{ morning:0.9, day:1.0, sunset:1.2, evening:1.0 }, friSunset:1.5 }
+  };
+
+  function mergeConfig(base, extra){
+    if(!extra) return base;
+    const out={...base};
+    ['endpointUrl','open','close','slotMins','useDemo','demoSeedA','demoSeedB'].forEach(k=>{ if(extra[k]!==undefined) out[k]=extra[k]; });
+    if(Array.isArray(extra.boats)) out.boats = extra.boats.map(b=> ({...b}));
+    out.pricing = {
+      ...base.pricing,
+      ...(extra.pricing||{}),
+      bands: { ...base.pricing.bands, ...(((extra.pricing)||{}).bands||{}) }
+    };
+    return out;
+  }
+
+  async function loadConfig(){
+    let cfg={...DEFAULT_CONFIG};
+    // try static config.json
+    try{ const res=await fetch('config.json',{cache:'no-store'}); if(res.ok){ const fileCfg=await res.json(); cfg=mergeConfig(cfg,fileCfg); } }catch{}
+    // apply local overrides
+    try{ const raw=localStorage.getItem(STORAGE_KEY); if(raw){ const local=JSON.parse(raw); cfg=mergeConfig(cfg,local); } }catch{}
+    return cfg;
+  }
   function pad2(n){ return String(n).padStart(2,'0'); }
 
   // Build YYYY-MM-DD date in TZ for today + offsetDays
@@ -94,14 +131,7 @@
   let weekOffset=0; // shifts by whole weeks (7 days) from today in Dubai
 
   async function render(){
-    const cfg=loadConfig();
-    if(!cfg){
-      app.innerHTML = `<div class="max-w-md mx-auto text-center bg-white rounded-2xl shadow p-6">
-        <h2 class="font-semibold text-lg mb-2">No settings found</h2>
-        <p class="text-sm text-gray-600 mb-4">Open admin and save configuration.</p>
-        <a href="admin.html" class="px-3 py-2 rounded-lg bg-indigo-600 text-white">Open Admin</a>
-      </div>`; return;
-    }
+    const cfg=await loadConfig();
 
     const baseToday = new Date();
     const rangeStartInTz = addDays(baseToday, 7*weekOffset);
@@ -118,7 +148,7 @@
     let data=null; let labelPrefix='';
     if(cfg.useDemo){
       // synthesize demo events for boats using seeds
-      const boats = (cfg.boats||[]).map((b,idx)=> ({ id:b.id, name:b.name, events: demoEventsForWeek(weekStartInTz, idx===0? (cfg.demoSeedA||42) : (cfg.demoSeedB||99)) }));
+      const boats = (cfg.boats||[]).map((b,idx)=> ({ id:b.id, name:b.name, events: demoEventsForWeek(rangeStartInTz, idx===0? (cfg.demoSeedA||42) : (cfg.demoSeedB||99)) }));
       data = { tz: TZ, boats };
       labelPrefix='demo • ';
     } else {
@@ -210,9 +240,8 @@
     app.innerHTML = header + `<div class="mx-auto ${isSmall?'max-w-sm':'max-w-4xl'}">` + content + `</div>`;
   }
 
-  function forceRefresh(){
-    const cfg=loadConfig();
-    if(!cfg) return location.href='admin.html';
+  async function forceRefresh(){
+    const cfg=await loadConfig();
     const baseToday=new Date();
     const rangeStartInTz = addDays(baseToday, 7*weekOffset);
     const startYMD = isoDateInTZ(rangeStartInTz, TZ);

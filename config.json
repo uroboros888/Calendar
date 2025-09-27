@@ -1,0 +1,19 @@
+{
+  "endpointUrl": "",
+  "open": "08:00",
+  "close": "23:00",
+  "slotMins": 60,
+  "useDemo": false,
+  "demoSeedA": 42,
+  "demoSeedB": 99,
+  "boats": [
+    { "id": "A", "name": "Yacht A", "baseRate": 800 },
+    { "id": "B", "name": "Yacht B", "baseRate": 1400 }
+  ],
+  "pricing": {
+    "roundTo": 50,
+    "bands": { "morning": 0.9, "day": 1.0, "sunset": 1.2, "evening": 1.0 },
+    "friSunset": 1.5
+  }
+}
+

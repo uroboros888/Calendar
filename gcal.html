@@ -51,17 +51,20 @@
   }
 
   async function loadConfig(){
-    let cfg={...DEFAULT_CONFIG};
-    // try static config.json (skip when running from file:// to avoid CORS noise)
+    let cfg={};
+    let hadFile=false;
+    // 1) First preference: static config.json (network/public hosting)
     if(location.protocol!=='file:'){
-      try{ const res=await fetch('config.json',{cache:'no-store'}); if(res.ok){ const fileCfg=await res.json(); cfg=mergeConfig(cfg,fileCfg); } }catch{}
+      try{ const res=await fetch('config.json',{cache:'no-store'}); if(res.ok){ cfg=mergeConfig(cfg, await res.json()); hadFile=true; } }catch{}
     }
-    // apply local overrides
+    // 2) If no file or partial, layer defaults for any missing fields
+    cfg = mergeConfig(DEFAULT_CONFIG, cfg);
+    // 3) Local overrides from Admin take precedence
     let hadLocal=false;
-    try{ const raw=localStorage.getItem(STORAGE_KEY); if(raw){ hadLocal=true; const local=JSON.parse(raw); cfg=mergeConfig(cfg,local); } }catch{}
-    // ensure endpoint fallback if empty override
-    if(!cfg.endpointUrl){ cfg.endpointUrl = DEFAULT_ENDPOINT; }
-    // if no local config existed, persist the merged defaults so Viewer/Admin are in sync
+    try{ const raw=localStorage.getItem(STORAGE_KEY); if(raw){ hadLocal=true; cfg=mergeConfig(cfg, JSON.parse(raw)); } }catch{}
+    // 4) If both file and local are missing endpoint, only then use built-in fallback
+    if(!cfg.endpointUrl && !hadFile){ cfg.endpointUrl = DEFAULT_ENDPOINT; }
+    // 5) If no local config existed, persist the effective cfg so Admin and Viewer stay in sync
     if(!hadLocal){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); }catch{} }
     return cfg;
   }

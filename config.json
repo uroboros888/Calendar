@@ -1,7 +1,7 @@
 {
   "endpointUrl": "https://script.google.com/macros/s/AKfycbwKj5564y7ek86sec9762IhmxI5dDTjH4mXI10RSAn4A_WCuDCpj13E4sWC1fFhVyxNYA/exec",
   "open": "08:00",
-  "close": "23:00",
+  "close": "24:00",
   "slotMins": 60,
   "useDemo": false,
   "demoSeedA": 42,
@@ -14,6 +14,8 @@
     "roundTo": 50,
     "bands": { "morning": 0.9, "day": 1.0, "sunset": 1.2, "evening": 1.0 },
     "friSunset": 1.5
-  }
+  },
+  "sunsetFile": "sunsets.dubai.json",
+  "sunsetWindowBefore": 60,
+  "sunsetWindowAfter": 60
 }
-

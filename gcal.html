@@ -31,8 +31,7 @@
         <div class="text-sm text-gray-600 whitespace-pre-wrap">${message}</div>
         <div class="mt-4 flex flex-wrap gap-2 justify-center">
           <button class="px-3 py-2 rounded-lg bg-indigo-600 text-white" onclick="location.reload()">Retry</button>
-          <a class="px-3 py-2 rounded-lg bg-white border" href="admin.html">Admin</a>
-          <button class="px-3 py-2 rounded-lg bg-white border" onclick="window.useDefaults&&window.useDefaults()">Use default endpoint</button>
+          <a class="px-3 py-2 rounded-lg bg-white border" href="mailto:support@example.com?subject=Yacht%20Calendar%20Support" rel="noopener">Contact Support</a>
           <button class="px-3 py-2 rounded-lg bg-white border" onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('dbg').innerText)">Copy logs</button>
         </div>
         <pre id="dbg" class="text-left mt-3 p-2 bg-gray-50 rounded max-h-64 overflow-auto text-xs">${details}</pre>
@@ -41,53 +40,14 @@
   window.addEventListener('error', (e)=>{ renderError('Runtime error', e.message||'unknown'); });
   window.addEventListener('unhandledrejection', (e)=>{ renderError('Unhandled promise', String(e.reason||e)); });
 
-  // Defaults including a hardcoded fallback endpoint
-  const DEFAULT_ENDPOINT = 'https://script.google.com/macros/s/AKfycbwKj5564y7ek86sec9762IhmxI5dDTjH4mXI10RSAn4A_WCuDCpj13E4sWC1fFhVyxNYA/exec';
-  const DEFAULT_CONFIG = {
-    endpointUrl: DEFAULT_ENDPOINT,
-    open: '08:00',
-    close: '23:00',
-    slotMins: 60,
-    useDemo: false,
-    demoSeedA: 42,
-    demoSeedB: 99,
-    boats: [
-      { id:'A', name:'Yacht A', baseRate:800 },
-      { id:'B', name:'Yacht B', baseRate:1400 },
-    ],
-    pricing: { roundTo:50, bands:{ morning:0.9, day:1.0, sunset:1.2, evening:1.0 }, friSunset:1.5 }
-  };
-
-  function mergeConfig(base, extra){
-    if(!extra) return base;
-    const out={...base};
-    ['endpointUrl','open','close','slotMins','useDemo','demoSeedA','demoSeedB'].forEach(k=>{ if(extra[k]!==undefined) out[k]=extra[k]; });
-    if(Array.isArray(extra.boats)) out.boats = extra.boats.map(b=> ({...b}));
-    out.pricing = {
-      ...base.pricing,
-      ...(extra.pricing||{}),
-      bands: { ...base.pricing.bands, ...(((extra.pricing)||{}).bands||{}) }
-    };
-    return out;
-  }
-
+  // Load only from config.json
   async function loadConfig(){
-    let cfg={};
-    let hadFile=false;
-    // 1) First preference: static config.json (network/public hosting)
-    if(location.protocol!=='file:'){
-      try{ const res=await fetch('config.json',{cache:'no-store'}); if(res.ok){ cfg=mergeConfig(cfg, await res.json()); hadFile=true; } }catch{}
+    if(location.protocol==='file:'){
+      throw new Error('config.json cannot be loaded over file://. Please serve via http(s).');
     }
-    // 2) If no file or partial, layer defaults for any missing fields
-    cfg = mergeConfig(DEFAULT_CONFIG, cfg);
-    // 3) Local overrides from Admin take precedence
-    let hadLocal=false;
-    try{ const raw=localStorage.getItem(STORAGE_KEY); if(raw){ hadLocal=true; cfg=mergeConfig(cfg, JSON.parse(raw)); } }catch{}
-    // 4) If both file and local are missing endpoint, only then use built-in fallback
-    if(!cfg.endpointUrl && !hadFile){ cfg.endpointUrl = DEFAULT_ENDPOINT; }
-    // 5) If no local config existed, persist the effective cfg so Admin and Viewer stay in sync
-    if(!hadLocal){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); }catch{} }
-    return cfg;
+    const res = await fetch('config.json', {cache:'no-store'});
+    if(!res.ok){ throw new Error('Failed to load config.json ('+res.status+')'); }
+    return await res.json();
   }
   function pad2(n){ return String(n).padStart(2,'0'); }
 
@@ -128,10 +88,35 @@
     return out;
   }
 
-  function makePriceFn(pr){
+  function makePriceFn(pr, opts={}){
     const round=(v)=> pr.roundTo>0? Math.round(v/pr.roundTo)*pr.roundTo : v;
-    const bandMult=(dt)=>{ const h=new Date(dt).getHours(); let m=(h>=8&&h<12)?pr.bands.morning:(h<17?pr.bands.day:(h<20?pr.bands.sunset:pr.bands.evening)); if(new Date(dt).getDay()===5 && h>=17 && h<20) m*=pr.friSunset; return m; };
-    return (base,dt)=> round(base * bandMult(dt));
+    const sunsetMap = opts.sunsets || null; // Map YYYY-MM-DD -> {hh, mm}
+    const before = Number(opts.sunsetWindowBefore||0);
+    const after = Number(opts.sunsetWindowAfter||0);
+    const parseHM = (s)=>{ const [hh,mm]=String(s).split(':').map(n=> Number(n||0)); return {hh,mm,mins:hh*60+mm}; };
+    const dateYMD = (d)=> isoDateInTZ(d,TZ);
+
+    function inSunsetWindow(dt){
+      if(!sunsetMap) return false;
+      const ymd=dateYMD(dt);
+      const ss = sunsetMap.get(ymd); if(!ss) return false;
+      const h=dt.getHours(), m=dt.getMinutes(); const mins=h*60+m;
+      return mins >= (ss.mins - before) && mins < (ss.mins + after);
+    }
+
+    function bandMultiplier(dt){
+      let mult;
+      if(inSunsetWindow(dt)) mult = pr.bands.sunset;
+      else {
+        const h=dt.getHours();
+        mult = (h>=8&&h<12)? pr.bands.morning : (h<17? pr.bands.day : (h<20? pr.bands.sunset : pr.bands.evening));
+      }
+      // Friday sunset extra only if inside sunset window (dynamic) or static 17-20 fallback
+      const isFri = dt.getDay()===5;
+      if(isFri && (inSunsetWindow(dt))) mult *= pr.friSunset;
+      return mult;
+    }
+    return (base,dt)=> round(base * bandMultiplier(dt));
   }
 
   async function fetchJson(url, timeoutMs=15000){
@@ -170,7 +155,13 @@
     const startYMD = isoDateInTZ(rangeStartInTz, TZ);
     const endYMD = isoDateInTZ(addDays(rangeStartInTz, 6), TZ);
 
-    const priceAt = makePriceFn(cfg.pricing);
+    // Load sunsets if specified
+    let sunsetsMap=null;
+    if(cfg.sunsetFile && location.protocol!=='file:'){
+      try{ const r=await fetch(String(cfg.sunsetFile),{cache:'no-store'}); if(r.ok){ const arr=await r.json(); const m=new Map(); arr.forEach(x=>{ if(x&&x.date&&x.sunset){ const [hh,mm]=String(x.sunset).split(':').map(Number); m.set(String(x.date), {hh,mm,mins:hh*60+mm}); } }); sunsetsMap=m; log('sunsets loaded', m.size); } }
+      catch(err){ log('sunsets load failed', err); }
+    }
+    const priceAt = makePriceFn(cfg.pricing, { sunsets: sunsetsMap, sunsetWindowBefore: cfg.sunsetWindowBefore, sunsetWindowAfter: cfg.sunsetWindowAfter });
     const isSmall = window.innerWidth < 420;
     const gridTimeCol = isSmall? 64 : 90; // px
     const gridGap = isSmall? 8 : 12;      // px
@@ -212,24 +203,39 @@
       return 'free';
     }
 
+    // Sunset window helper
+    const sunsetBefore = Number(cfg.sunsetWindowBefore||0);
+    const sunsetAfter  = Number(cfg.sunsetWindowAfter||0);
+    function inSunsetWindow(dt){
+      if(!sunsetsMap) return false;
+      const ymd = isoDateInTZ(dt, TZ);
+      const ss = sunsetsMap.get(ymd); if(!ss) return false;
+      const mins = dt.getHours()*60 + dt.getMinutes();
+      return mins >= (ss.mins - sunsetBefore) && mins < (ss.mins + sunsetAfter);
+    }
+
     function HourlyDay(dayYMD){
-      const rows=[]; // array of {label, cells:[{id, status, price}]}
+      const rows=[]; // {label, cells, sunset}
       const {open, close, slotMins}=cfg;
       const [oh,om]=open.split(':').map(Number); const [ch,cm]=close.split(':').map(Number);
       const openM=oh*60+om, closeM=ch*60+cm, step=slotMins;
+      // Sunset boundaries in minutes
+      let ss=null, ssStart=null, ssEnd=null;
+      if(sunsetsMap){ ss = sunsetsMap.get(dayYMD); if(ss){ ssStart = ss.mins - sunsetBefore; ssEnd = ss.mins + sunsetAfter; } }
       for(let m=openM; m+step<=closeM; m+=step){
         const hh=Math.floor(m/60), mm=m%60; const nextH=Math.floor((m+step)/60), nextM=(m+step)%60;
         const h12=((hh+11)%12)+1; const ap = hh<12 ? 'AM':'PM';
-        const label = mm===0 ? `${h12} ${ap}` : `${h12}:${String(mm).padStart(2,'0')} ${ap}`;
+        const labelCore = mm===0 ? `${h12} ${ap}` : `${h12}:${String(mm).padStart(2,'0')} ${ap}`;
         const slotStart=dubaiSlotDate(dayYMD, `${pad2(hh)}:${pad2(mm)}`);
-        const slotEnd=dubaiSlotDate(dayYMD, `${pad2(nextH)}:${pad2(nextM)}`);
+        const slotEnd=addMinutes(slotStart, step);
         const cells = boats.map(b=>{
           const st = statusFor(b.events||[], slotStart, slotEnd);
           const base = boatsCfgById[b.id].baseRate;
           const price = st==='free'? priceAt(base, slotStart) : null;
           return {id:b.id, status: st, price};
         });
-        rows.push({label, cells});
+        const inSun = ss ? (m < ssEnd && (m+step) > ssStart) : false;
+        rows.push({label: labelCore, cells, sunset: inSun});
       }
       return rows;
     }
@@ -259,11 +265,14 @@
           <div class="flex items-center justify-between mb-3">
             <div class="flex items-center gap-2">${DayHeader(dayList[i])}</div>
           </div>
-          <div class="grid" style="grid-template-columns:${gridTimeCol}px 1fr 1fr; gap:${gridGap}px; align-items:center; grid-auto-rows:${rowH}px;">
-            <div></div>
+          <div class="grid" style="grid-template-columns:6px ${gridTimeCol}px 1fr 1fr; gap:${gridGap}px; align-items:center; grid-auto-rows:auto;">
+            <div></div><div></div>
             ${boatNames.map(n=> `<div class=\"${isSmall?'text-sm':'text-sm'} font-semibold text-gray-700 text-center pb-1\">${n}</div>`).join('')}
             ${rows.map(r=> `
-              <div class="${isSmall?'text-base':'text-sm'} text-gray-700 tn-nums text-right ${isSmall?'pr-2':'pr-3'}">${r.label}</div>
+              <div style="height:${rowH}px; display:flex; align-items:center; justify-content:center;">
+                ${r.sunset? '<div style="width:2px; height:100%; background:#fb923c; border-radius:9999px"></div>' : ''}
+              </div>
+              <div class="${isSmall?'text-base':'text-sm'} text-gray-700 tn-nums text-right ${isSmall?'pr-2':'pr-3'} flex items-center justify-end" style="height:${rowH}px;">${r.label}</div>
               ${r.cells.map(c=> c.status==='free' ? `<div class=\"w-full rounded-lg bg-green-100 text-green-900 ${isSmall?'text-[11px]':'text-xs'} flex items-center justify-center\" style=\"height:${rowH}px\">${c.price} AED</div>` : (c.status==='busy'? `<div class=\"w-full rounded-lg bg-red-300/80 text-[11px] text-red-900 flex items-center justify-center\" style=\"height:${rowH}px\">Busy</div>` : `<div class=\"w-full ${isSmall?'text-[11px]':'text-xs'} text-gray-300 flex items-center justify-center\" style=\"height:${rowH}px\">—</div>`)).join('')}
             `).join('')}
           </div>

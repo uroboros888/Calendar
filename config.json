@@ -7,8 +7,8 @@
   "demoSeedA": 42,
   "demoSeedB": 99,
   "boats": [
-    { "id": "VD40", "name": "Van Dutch 40", "baseRate": 800 },
-    { "id": "MC6", "name": "Monte Carlo 60", "baseRate": 1400 }
+    { "id": "A", "name": "Van Dutch 40", "baseRate": 800 },
+    { "id": "B", "name": "Monte Carlo 60", "baseRate": 1400 }
   ],
   "pricing": {
     "roundTo": 50,

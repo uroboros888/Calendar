@@ -20,6 +20,27 @@
 
   const app=document.getElementById('app');
 
+  // --- Lightweight logging & error surface ---
+  const __logs=[];
+  function log(){ try{ console.log.apply(console, arguments); __logs.push(Array.from(arguments).map(x=> typeof x==='object'? JSON.stringify(x): String(x)).join(' ')); }catch{} }
+  function renderError(title, message){
+    const details = __logs.slice(-30).join('\n');
+    app.innerHTML = `
+      <div class="max-w-md mx-auto text-center bg-white rounded-2xl shadow p-6">
+        <h2 class="font-semibold text-lg mb-2">${title}</h2>
+        <div class="text-sm text-gray-600 whitespace-pre-wrap">${message}</div>
+        <div class="mt-4 flex flex-wrap gap-2 justify-center">
+          <button class="px-3 py-2 rounded-lg bg-indigo-600 text-white" onclick="location.reload()">Retry</button>
+          <a class="px-3 py-2 rounded-lg bg-white border" href="admin.html">Admin</a>
+          <button class="px-3 py-2 rounded-lg bg-white border" onclick="window.useDefaults&&window.useDefaults()">Use default endpoint</button>
+          <button class="px-3 py-2 rounded-lg bg-white border" onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('dbg').innerText)">Copy logs</button>
+        </div>
+        <pre id="dbg" class="text-left mt-3 p-2 bg-gray-50 rounded max-h-64 overflow-auto text-xs">${details}</pre>
+      </div>`;
+  }
+  window.addEventListener('error', (e)=>{ renderError('Runtime error', e.message||'unknown'); });
+  window.addEventListener('unhandledrejection', (e)=>{ renderError('Unhandled promise', String(e.reason||e)); });
+
   // Defaults including a hardcoded fallback endpoint
   const DEFAULT_ENDPOINT = 'https://script.google.com/macros/s/AKfycbwKj5564y7ek86sec9762IhmxI5dDTjH4mXI10RSAn4A_WCuDCpj13E4sWC1fFhVyxNYA/exec';
   const DEFAULT_CONFIG = {
@@ -142,6 +163,7 @@
 
   async function render(){
     const cfg=await loadConfig();
+    log('cfg.endpoint', cfg.endpointUrl);
 
     const baseToday = new Date();
     const rangeStartInTz = addDays(baseToday, 7*weekOffset);
@@ -170,12 +192,13 @@
           const url = `${cfg.endpointUrl}?start=${startYMD}&end=${endYMD}&tz=${encodeURIComponent(TZ)}`;
           // Use JSONP for Apps Script URLs to avoid CORS on GitHub Pages
           const useJsonp = /script\.googleusercontent\.com|script\.google\.com/.test(cfg.endpointUrl);
+          log('fetch url', url, 'mode', useJsonp? 'jsonp':'fetch');
           data = useJsonp ? await fetchJsonp(url) : await fetchJson(url);
           cacheSet(key, data);
         }catch(err){
           const cachedAny = cacheGet(key, Infinity);
           if(cachedAny){ data=cachedAny; usedCache=true; }
-          else { app.innerHTML = `<div class=\"max-w-md mx-auto text-center bg-white rounded-2xl shadow p-6\">\n          <h2 class=\"font-semibold text-lg mb-2\">Load failed</h2>\n          <div class=\"text-sm text-gray-600\">${String(err.message||err)}</div>\n          <div class=\"mt-4 flex flex-wrap gap-2 justify-center\">\n            <button class=\"px-3 py-2 rounded-lg bg-indigo-600 text-white\" onclick=\"location.reload()\">Retry</button>\n            <a class=\"px-3 py-2 rounded-lg bg-white border\" href=\"admin.html\">Admin</a>\n            <button class=\"px-3 py-2 rounded-lg bg-white border\" onclick=\"window.useDefaults&&window.useDefaults()\">Use default endpoint</button>\n          </div></div>`; return; }
+          else { log('load failed', err); renderError('Load failed', String(err&&err.message||err)); return; }
         }
       }
       labelPrefix = usedCache? 'cached • ' : '';

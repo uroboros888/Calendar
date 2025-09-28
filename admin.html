@@ -43,12 +43,36 @@
 
   const app = document.getElementById('app');
 
-  function loadConfig(){
-    try{ const raw = localStorage.getItem(STORAGE_KEY); if(!raw) return {...DEFAULT_CONFIG}; const cfg=JSON.parse(raw); return {...DEFAULT_CONFIG, ...cfg}; }catch(e){ return {...DEFAULT_CONFIG}; }
+  async function loadConfig(){
+    // Prefer config.json, then localStorage; always persist effective config to localStorage
+    let cfg = {...DEFAULT_CONFIG};
+    if(location.protocol !== 'file:'){
+      try{
+        const res = await fetch('config.json', {cache:'no-store'});
+        if(res.ok){ const fileCfg = await res.json(); cfg = mergeConfig(cfg, fileCfg); }
+      }catch{}
+    }
+    try{ const raw = localStorage.getItem(STORAGE_KEY); if(raw){ const local = JSON.parse(raw); cfg = mergeConfig(cfg, local, /*jsonPriority*/ true); } }catch{}
+    try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); }catch{}
+    return cfg;
   }
   function saveConfig(cfg){ localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); }
 
-  let state = loadConfig();
+  function mergeConfig(base, extra, jsonPriority=false){
+    if(!extra) return base;
+    const out = {...base};
+    const set = (k)=>{ if(extra[k] !== undefined) out[k]= extra[k]; };
+    ['endpointUrl','timeZone','open','close','slotMins','useDemo','demoSeedA','demoSeedB'].forEach(set);
+    if(Array.isArray(extra.boats)) out.boats = extra.boats.map(b=> ({...b}));
+    out.pricing = {
+      ...base.pricing,
+      ...(extra.pricing||{}),
+      bands: { ...base.pricing.bands, ...(((extra.pricing)||{}).bands||{}) }
+    };
+    return out;
+  }
+
+  let state = {...DEFAULT_CONFIG};
 
   function input(name, value, attrs=''){
     return `<input id="${name}" value="${value}" class="w-full px-3 py-2 bg-white rounded-lg border" ${attrs}/>`;
@@ -173,7 +197,7 @@
 
   function toast(msg){ const el=document.getElementById('toast'); el.textContent=msg; setTimeout(()=> el.textContent='', 1500); }
 
-  render();
+  (async function init(){ state = await loadConfig(); render(); })();
   </script>
 </body>
 </html>

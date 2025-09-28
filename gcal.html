@@ -55,7 +55,7 @@
   function zonedDateParts(date, timeZone){
     const parts = new Intl.DateTimeFormat('en-CA',{timeZone,year:'numeric',month:'2-digit',day:'2-digit',weekday:'short',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(date);
     const map={}; parts.forEach(p=> map[p.type]=p.value);
-    return { y: Number(map.year), m: Number(map.month), d: Number(map.day), wd: map.weekday };
+    return { y: Number(map.year), m: Number(map.month), d: Number(map.day), wd: map.weekday, h: Number(map.hour), mi: Number(map.minute) };
   }
   function isoDateInTZ(date, timeZone){ const p=zonedDateParts(date,timeZone); return `${p.y}-${pad2(p.m)}-${pad2(p.d)}`; }
 
@@ -151,6 +151,9 @@
     log('cfg.endpoint', cfg.endpointUrl);
 
     const baseToday = new Date();
+    const nowP = zonedDateParts(baseToday, TZ);
+    const nowYMD = `${nowP.y}-${pad2(nowP.m)}-${pad2(nowP.d)}`;
+    const nowMinutes = nowP.h*60 + nowP.mi;
     const rangeStartInTz = addDays(baseToday, 7*weekOffset);
     const startYMD = isoDateInTZ(rangeStartInTz, TZ);
     const endYMD = isoDateInTZ(addDays(rangeStartInTz, 6), TZ);
@@ -164,6 +167,7 @@
     const priceAt = makePriceFn(cfg.pricing, { sunsets: sunsetsMap, sunsetWindowBefore: cfg.sunsetWindowBefore, sunsetWindowAfter: cfg.sunsetWindowAfter });
     const isSmall = window.innerWidth < 420;
     const gridTimeCol = isSmall? 64 : 90; // px
+    const gridLineCol = isSmall? 4 : 8;   // px
     const gridGap = isSmall? 8 : 12;      // px
     const rowH = isSmall? 28 : 36;        // px
 
@@ -222,6 +226,7 @@
       // Sunset boundaries in minutes
       let ss=null, ssStart=null, ssEnd=null;
       if(sunsetsMap){ ss = sunsetsMap.get(dayYMD); if(ss){ ssStart = ss.mins - sunsetBefore; ssEnd = ss.mins + sunsetAfter; } }
+      const isTodayDubai = (dayYMD===nowYMD);
       for(let m=openM; m+step<=closeM; m+=step){
         const hh=Math.floor(m/60), mm=m%60; const nextH=Math.floor((m+step)/60), nextM=(m+step)%60;
         const h12=((hh+11)%12)+1; const ap = hh<12 ? 'AM':'PM';
@@ -235,7 +240,8 @@
           return {id:b.id, status: st, price};
         });
         const inSun = ss ? (m < ssEnd && (m+step) > ssStart) : false;
-        rows.push({label: labelCore, cells, sunset: inSun});
+        const isNow = isTodayDubai && (m <= nowMinutes) && (nowMinutes < m+step);
+        rows.push({label: labelCore, cells, sunset: inSun, now: isNow});
       }
       return rows;
     }
@@ -265,12 +271,13 @@
           <div class="flex items-center justify-between mb-3">
             <div class="flex items-center gap-2">${DayHeader(dayList[i])}</div>
           </div>
-          <div class="grid" style="grid-template-columns:6px ${gridTimeCol}px 1fr 1fr; gap:${gridGap}px; align-items:center; grid-auto-rows:auto;">
+          <div class="grid" style="grid-template-columns:${gridLineCol}px ${gridTimeCol}px 1fr 1fr; gap:${gridGap}px; align-items:center; grid-auto-rows:auto;">
             <div></div><div></div>
             ${boatNames.map(n=> `<div class=\"${isSmall?'text-sm':'text-sm'} font-semibold text-gray-700 text-center pb-1\">${n}</div>`).join('')}
             ${rows.map(r=> `
-              <div style="height:${rowH}px; display:flex; align-items:center; justify-content:center;">
-                ${r.sunset? '<div style="width:2px; height:100%; background:#fb923c; border-radius:9999px"></div>' : ''}
+              <div style="height:${rowH}px; position:relative; display:flex; align-items:center; justify-content:center;">
+                ${r.sunset? `<div style=\"position:absolute; width:${isSmall?2:3}px; height:100%; background:#f59e0b; border-radius:9999px\"></div>` : ''}
+                ${r.now? '<div style=\"width:6px; height:6px; background:#3b82f6; border-radius:9999px; box-shadow:0 0 0 2px rgba(255,255,255,0.85)\"></div>' : ''}
               </div>
               <div class="${isSmall?'text-base':'text-sm'} text-gray-700 tn-nums text-right ${isSmall?'pr-2':'pr-3'} flex items-center justify-end" style="height:${rowH}px;">${r.label}</div>
               ${r.cells.map(c=> c.status==='free' ? `<div class=\"w-full rounded-lg bg-green-100 text-green-900 ${isSmall?'text-[11px]':'text-xs'} flex items-center justify-center\" style=\"height:${rowH}px\">${c.price} AED</div>` : (c.status==='busy'? `<div class=\"w-full rounded-lg bg-red-300/80 text-[11px] text-red-900 flex items-center justify-center\" style=\"height:${rowH}px\">Busy</div>` : `<div class=\"w-full ${isSmall?'text-[11px]':'text-xs'} text-gray-300 flex items-center justify-center\" style=\"height:${rowH}px\">—</div>`)).join('')}

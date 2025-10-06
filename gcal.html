@@ -16,7 +16,8 @@
   <script>
   const STORAGE_KEY='yachtCalendarConfig';
   const TZ='Asia/Dubai'; // fixed per requirements
-  const fmt = (d, opts={}) => new Intl.DateTimeFormat(undefined, {...opts, timeZone: TZ}).format(d);
+  // Force English locale for month/day names
+  const fmt = (d, opts={}) => new Intl.DateTimeFormat('en', {...opts, timeZone: TZ}).format(d);
 
   const app=document.getElementById('app');
 
@@ -254,7 +255,7 @@
     const weekEnd = addDays(rangeStartInTz,6);
     const header = `
       <div class="flex flex-col items-center gap-2 mb-4 text-center">
-        <h1 class="font-semibold tracking-tight text-2xl">Yacht Availability</h1>
+        <h1 class="font-semibold tracking-tight text-2xl">Imperial Yachting</h1>
         <p class="text-sm text-gray-600">Intervals • ${labelPrefix}${fmt(rangeStartInTz,{month:'short',day:'2-digit'})} — ${fmt(weekEnd,{month:'short',day:'2-digit'})} • ${TZ}</p>
         <div class="flex items-center gap-2">
           <button class="px-3 py-2 rounded-xl bg-white shadow" onclick="weekOffset--; render()">←</button>

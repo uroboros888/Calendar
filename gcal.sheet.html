@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Yacht Calendar — Viewer (Sheet Pricing)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html,body{height:100%}
+    .tn-nums{font-variant-numeric: tabular-nums;}
+  </style>
+</head>
+<body class="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100 text-gray-900">
+  <div id="app" class="mx-auto px-4 py-6 max-w-5xl"></div>
+
+  <script>
+  const STORAGE_KEY='yachtCalendarConfigSheet';
+  const TZ='Asia/Dubai';
+  const fmt = (d, opts={}) => new Intl.DateTimeFormat('en', {...opts, timeZone: TZ}).format(d);
+  const DOW_SHORT_TO_KEY = { Sun:'sunday', Mon:'monday', Tue:'tuesday', Wed:'wednesday', Thu:'thursday', Fri:'friday', Sat:'saturday' };
+
+  const app=document.getElementById('app');
+  const __logs=[];
+
+  function log(){
+    try{
+      console.log.apply(console, arguments);
+      __logs.push(Array.from(arguments).map(x=> typeof x==='object'? JSON.stringify(x): String(x)).join(' '));
+    }catch{}
+  }
+
+  function renderError(title, message){
+    const details = __logs.slice(-30).join('\n');
+    app.innerHTML = `
+      <div class="max-w-md mx-auto text-center bg-white rounded-2xl shadow p-6">
+        <h2 class="font-semibold text-lg mb-2">${title}</h2>
+        <div class="text-sm text-gray-600 whitespace-pre-wrap">${message}</div>
+        <div class="mt-4 flex flex-wrap gap-2 justify-center">
+          <button class="px-3 py-2 rounded-lg bg-indigo-600 text-white" onclick="location.reload()">Retry</button>
+          <a class="px-3 py-2 rounded-lg bg-white border" href="mailto:support@example.com?subject=Yacht%20Calendar%20Support" rel="noopener">Contact Support</a>
+          <button class="px-3 py-2 rounded-lg bg-white border" onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('dbg').innerText)">Copy logs</button>
+        </div>
+        <pre id="dbg" class="text-left mt-3 p-2 bg-gray-50 rounded max-h-64 overflow-auto text-xs">${details}</pre>
+      </div>`;
+  }
+
+  window.addEventListener('error', (e)=>{ renderError('Runtime error', e.message||'unknown'); });
+  window.addEventListener('unhandledrejection', (e)=>{ renderError('Unhandled promise', String(e.reason||e)); });
+
+  async function loadConfig(){
+    if(location.protocol==='file:'){
+      throw new Error('config.json cannot be loaded over file://. Please serve via http(s).');
+    }
+    const res = await fetch('config.json', {cache:'no-store'});
+    if(!res.ok){ throw new Error('Failed to load config.json ('+res.status+')'); }
+    return await res.json();
+  }
+
+  function pad2(n){ return String(n).padStart(2,'0'); }
+
+  function zonedDateParts(date, timeZone){
+    const parts = new Intl.DateTimeFormat('en-CA',{timeZone,year:'numeric',month:'2-digit',day:'2-digit',weekday:'short',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(date);
+    const map={}; parts.forEach(p=> map[p.type]=p.value);
+    return { y: Number(map.year), m: Number(map.month), d: Number(map.day), wd: map.weekday, h: Number(map.hour), mi: Number(map.minute) };
+  }
+
+  function isoDateInTZ(date, timeZone){ const p=zonedDateParts(date,timeZone); return `${p.y}-${pad2(p.m)}-${pad2(p.d)}`; }
+  function addDays(d, n){ const x=new Date(d); x.setUTCDate(x.getUTCDate()+n); return x; }
+  function addMinutes(date, mins){ const d=new Date(date); d.setMinutes(d.getMinutes()+mins); return d; }
+
+  function hmToMinutes(str){
+    const parts = String(str||'0:0').split(':');
+    const hh = Number(parts[0])||0;
+    const mm = Number(parts[1])||0;
+    return hh*60 + mm;
+  }
+
+  function minutesDiffWrap(start, end){
+    let diff = end - start;
+    if (diff <= 0) diff += 24*60;
+    return diff;
+  }
+
+  function dateAtMinutes(ymd, minutes){
+    const base = new Date(`${ymd}T00:00:00+04:00`);
+    return new Date(base.getTime() + minutes*60000);
+  }
+
+  function random(seed){ return ()=> (seed = (seed*9301 + 49297) % 233280) / 233280; }
+
+  function demoEventsForWeek(weekStartInTz, seed, openHM='08:00', closeHM='23:00'){
+    const out=[]; const rnd=random(seed);
+    for(let d=0; d<7; d++){
+      const ymd = isoDateInTZ(addDays(weekStartInTz,d), TZ);
+      let cursor = dateAtMinutes(ymd, hmToMinutes(openHM));
+      const closeMin = hmToMinutes(closeHM);
+      const dayEnd = dateAtMinutes(ymd, closeMin>=24*60? (closeMin-1): closeMin);
+      const n = 1 + Math.floor(rnd()*3);
+      for(let i=0;i<n;i++){
+        const startOffset = (Math.floor(rnd()*9))*30;
+        const dur = (2 + Math.floor(rnd()*9))*30;
+        const start = addMinutes(cursor, startOffset);
+        let end = addMinutes(start, dur);
+        if(end>dayEnd) end=dayEnd;
+        cursor = addMinutes(end, (Math.floor(rnd()*5))*30);
+        out.push({start, end});
+      }
+    }
+    return out;
+  }
+
+  async function fetchJson(url, timeoutMs=15000){
+    const ctrl=new AbortController(); const t=setTimeout(()=>ctrl.abort(), timeoutMs);
+    try{
+      const res= await fetch(url,{signal:ctrl.signal});
+      if(!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } finally{ clearTimeout(t); }
+  }
+
+  function fetchJsonp(url, timeoutMs=15000){
+    return new Promise((resolve, reject)=>{
+      const cb = `yc_cb_${Date.now()}_${Math.floor(Math.random()*1e6)}`;
+      const sep = url.includes('?') ? '&' : '?';
+      const src = `${url}${sep}callback=${cb}&_=${Date.now()}`;
+      const s = document.createElement('script');
+      let done=false;
+      const timer=setTimeout(()=>{ cleanup(); reject(new Error('JSONP timeout')); }, timeoutMs);
+      function cleanup(){ if(done) return; done=true; clearTimeout(timer); delete window[cb]; if(s.parentNode) s.parentNode.removeChild(s); }
+      window[cb] = (data)=>{ cleanup(); resolve(data); };
+      s.onerror = ()=>{ cleanup(); reject(new Error('JSONP load error')); };
+      s.src = src; document.head.appendChild(s);
+    });
+  }
+
+  function cacheGet(key, ttlMs){ try{ const raw=localStorage.getItem(key); if(!raw) return null; const obj=JSON.parse(raw); if(Date.now()-obj.t>ttlMs) return null; return obj.v; }catch{ return null; } }
+  function cacheSet(key, v){ try{ localStorage.setItem(key, JSON.stringify({t:Date.now(), v})); }catch{} }
+
+  function shouldUseJsonp(url){ return /script\.googleusercontent\.com|script\.google\.com/.test(url); }
+
+  function makeUrl(base, params){
+    const u = new URL(base, location.href);
+    Object.keys(params||{}).forEach(k=>{ if(params[k]!==undefined && params[k]!==null) u.searchParams.set(k, params[k]); });
+    return u.toString();
+  }
+
+  async function fetchPricingConfig(cfg){
+    const base = cfg.pricingEndpointUrl || cfg.endpointUrl;
+    const url = cfg.pricingEndpointUrl ? base : makeUrl(base, { mode: 'pricing' });
+    const data = shouldUseJsonp(url) ? await fetchJsonp(url) : await fetchJson(url);
+    if(data && data._nameById) delete data._nameById;
+    return data;
+  }
+
+  function overlapMinutes(aStart, aEnd, bStart, bEnd){
+    const start = Math.max(aStart.getTime(), bStart.getTime());
+    const end = Math.min(aEnd.getTime(), bEnd.getTime());
+    return start < end ? (end - start) / 60000 : 0;
+  }
+
+  function computeOccupancy(boats, dayYMD, openHM, closeHM){
+    const openMin = hmToMinutes(openHM);
+    const closeMin = hmToMinutes(closeHM);
+    const duration = minutesDiffWrap(openMin, closeMin);
+    const totalMinutes = duration * dayYMD.length;
+    const busy = {};
+    boats.forEach(b=> busy[b.id]=0);
+    dayYMD.forEach(ymd=>{
+      const dayStart = dateAtMinutes(ymd, openMin);
+      const dayEnd = new Date(dayStart.getTime() + duration*60000);
+      boats.forEach(b=>{
+        (b.events||[]).forEach(ev=>{
+          const s = new Date(ev.start);
+          const e = new Date(ev.end);
+          const overlap = overlapMinutes(s,e,dayStart,dayEnd);
+          if(overlap>0){ busy[b.id]+=overlap; }
+        });
+      });
+    });
+    const result={};
+    boats.forEach(b=>{
+      const busyMinutes = busy[b.id]||0;
+      const ratio = totalMinutes>0? Math.max(0, Math.min(1, busyMinutes/totalMinutes)) : 0;
+      result[b.id]={ busyMinutes, totalMinutes, ratio };
+    });
+    return result;
+  }
+
+  function resolveBandMultiplier(bands, minute, boatId){
+    for(const band of bands){
+      const start = Number(band.startMinutes);
+      const end = Number(band.endMinutes);
+      if(!isFinite(start) || !isFinite(end)) continue;
+      let match;
+      if(start === end){ match = true; }
+      else if(start < end){ match = minute >= start && minute < end; }
+      else { match = minute >= start || minute < end; }
+      if(match){
+        const multipliers = band.multipliers || {};
+        const val = multipliers[boatId] ?? multipliers['*'] ?? multipliers.default;
+        if(isFinite(val) && !isNaN(val)) return Number(val);
+        return 1;
+      }
+    }
+    return 1;
+  }
+
+  function resolveDowMultiplier(map, dowKey, boatId){
+    if(!dowKey) return 1;
+    const row = map && map[dowKey];
+    if(!row) return 1;
+    const val = row[boatId] ?? row['*'] ?? row.default;
+    return isFinite(val) && !isNaN(val) ? Number(val) : 1;
+  }
+
+  function resolveBusyMultiplier(levels, ratio, boatId){
+    if(!levels || !levels.length || ratio===null || ratio===undefined) return 1;
+    for(const level of levels){
+      const from = typeof level.from==='number'? level.from : Number(level.from)||0;
+      const toRaw = level.to;
+      const to = (toRaw===null || toRaw===undefined || toRaw==='') ? null : Number(toRaw);
+      const inRange = ratio >= from && (to===null ? ratio <= 1 : ratio <= to + 1e-9);
+      if(inRange){
+        const val = level.multipliers && (level.multipliers[boatId] ?? level.multipliers['*'] ?? level.multipliers.default);
+        if(isFinite(val) && !isNaN(val)) return Number(val);
+        break;
+      }
+    }
+    return 1;
+  }
+
+  function createSheetPriceCalculator(pricing, occupancy){
+    const boatsMap = new Map();
+    (pricing.boats||[]).forEach(b=>{
+      boatsMap.set(b.id, {
+        id: b.id,
+        name: b.name || b.id,
+        baseRate: Number(b.baseRate||0),
+        minRate: b.minRate!==undefined && b.minRate!==null && b.minRate!=='' ? Number(b.minRate) : null,
+        maxRate: b.maxRate!==undefined && b.maxRate!==null && b.maxRate!=='' ? Number(b.maxRate) : null,
+        roundTo: b.roundTo!==undefined && b.roundTo!==null && b.roundTo!=='' ? Number(b.roundTo) : null
+      });
+    });
+    const bands = (pricing.bands||[]).map(b=>({
+      label: b.label||b.name||'',
+      startMinutes: Number(b.startMinutes!==undefined? b.startMinutes : hmToMinutes(b.start)),
+      endMinutes: Number(b.endMinutes!==undefined? b.endMinutes : hmToMinutes(b.end)),
+      multipliers: b.multipliers||{}
+    }));
+    const dowMap = pricing.dowMultipliers || {};
+    const busyLevels = (pricing.busyLevels||[]).map(l=>({
+      from: l.from,
+      to: l.to,
+      multipliers: l.multipliers||{}
+    }));
+    const defaultRound = pricing.defaultRoundTo ? Number(pricing.defaultRoundTo) : null;
+
+    return (boatId, slotStart)=>{
+      const boat = boatsMap.get(boatId);
+      if(!boat || !boat.baseRate) return null;
+      const parts = zonedDateParts(slotStart, TZ);
+      const minute = parts.h*60 + parts.mi;
+      const dowKey = DOW_SHORT_TO_KEY[parts.wd] || null;
+      const occ = occupancy[boatId];
+      const bandMult = resolveBandMultiplier(bands, minute, boatId);
+      const dowMult = resolveDowMultiplier(dowMap, dowKey, boatId);
+      const busyMult = resolveBusyMultiplier(busyLevels, occ? occ.ratio : null, boatId);
+      let price = boat.baseRate * bandMult * dowMult * busyMult;
+      if(isFinite(boat.minRate) && boat.minRate!==null){ price = Math.max(boat.minRate, price); }
+      if(isFinite(boat.maxRate) && boat.maxRate!==null && boat.maxRate>0){ price = Math.min(boat.maxRate, price); }
+      const roundTo = boat.roundTo && boat.roundTo>0 ? boat.roundTo : (defaultRound && defaultRound>0 ? defaultRound : 0);
+      if(roundTo>0){ price = Math.round(price/roundTo)*roundTo; }
+      return Math.round(price);
+    };
+  }
+
+  function makeStatus(events, slotStart, slotEnd){
+    for(const ev of events){ const s=new Date(ev.start), e=new Date(ev.end); if(s < slotEnd && e > slotStart) return 'busy'; }
+    return 'free';
+  }
+
+  let weekOffset=0;
+
+  async function render(){
+    const cfg=await loadConfig();
+    log('cfg.endpoint', cfg.endpointUrl);
+
+    const baseToday = new Date();
+    const nowP = zonedDateParts(baseToday, TZ);
+    const nowYMD = `${nowP.y}-${pad2(nowP.m)}-${pad2(nowP.d)}`;
+    const nowMinutes = nowP.h*60 + nowP.mi;
+    const rangeStartInTz = addDays(baseToday, 7*weekOffset);
+    const startYMD = isoDateInTZ(rangeStartInTz, TZ);
+    const endYMD = isoDateInTZ(addDays(rangeStartInTz, 6), TZ);
+
+    let sunsetsMap=null;
+    if(cfg.sunsetFile && location.protocol!=='file:'){
+      try{
+        const r=await fetch(String(cfg.sunsetFile),{cache:'no-store'});
+        if(r.ok){
+          const arr=await r.json();
+          const m=new Map();
+          arr.forEach(x=>{
+            if(x&&x.date&&x.sunset){
+              const [hh,mm]=String(x.sunset).split(':').map(Number);
+              m.set(String(x.date), {hh,mm,mins:hh*60+mm});
+            }
+          });
+          sunsetsMap=m;
+          log('sunsets loaded', m.size);
+        }
+      }catch(err){ log('sunsets load failed', err); }
+    }
+
+    const key=`yachtCalendarCache|combined|${cfg.endpointUrl}|${startYMD}`;
+    let data=null; let pricing=null; let labelPrefix='';
+
+    if(cfg.useDemo){
+      pricing = await fetchPricingConfig(cfg);
+      if(!pricing){ throw new Error('Pricing configuration unavailable'); }
+      const demoSeedA = cfg.demoSeedA||42;
+      const demoSeedB = cfg.demoSeedB||99;
+      const openForDemo = pricing.open || cfg.open || '08:00';
+      const closeForDemo = pricing.close || cfg.close || '23:00';
+      const boatsForDemo = (pricing.boats||[]).map((b, idx)=>({
+        id: b.id,
+        name: b.name || b.id,
+        events: demoEventsForWeek(rangeStartInTz, idx===0? demoSeedA : demoSeedB, openForDemo, closeForDemo)
+      }));
+      data = { tz: TZ, boats: boatsForDemo };
+      labelPrefix='demo • ';
+    } else {
+      data = cacheGet(key, 10*60*1000);
+      let usedCache=false;
+      if(!data){
+        app.innerHTML = `<div class="text-center text-sm text-gray-600">Loading ${startYMD}…</div>`;
+        try{
+          const url = makeUrl(cfg.endpointUrl, { start:startYMD, end:endYMD, tz:TZ, mode:'combined' });
+          const useJsonp = shouldUseJsonp(cfg.endpointUrl);
+          log('fetch url', url, 'mode', useJsonp? 'jsonp':'fetch');
+          data = useJsonp ? await fetchJsonp(url) : await fetchJson(url);
+          cacheSet(key, data);
+        }catch(err){
+          const cachedAny = cacheGet(key, Infinity);
+          if(cachedAny){ data=cachedAny; usedCache=true; }
+          else { log('load failed', err); renderError('Load failed', String(err&&err.message||err)); return; }
+        }
+      }
+      labelPrefix = usedCache? 'cached • ' : '';
+      pricing = data && data.pricing ? data.pricing : null;
+      if(!pricing){
+        log('combined payload missing pricing, fetching separately');
+        pricing = await fetchPricingConfig(cfg);
+      }
+    }
+
+    if(!pricing){
+      renderError('Pricing missing', 'Pricing configuration could not be loaded.');
+      return;
+    }
+    if(pricing._nameById) delete pricing._nameById;
+
+    const openHM = pricing.open || cfg.open || '08:00';
+    const closeHM = pricing.close || cfg.close || '24:00';
+    const slotMins = Number(pricing.slotMins || cfg.slotMins || 60);
+
+    const boatsCfgById = new Map((pricing.boats||[]).map(b=> [b.id, b]));
+    const boats = (data.boats || []).filter(b=> boatsCfgById.has(b.id));
+    boats.forEach(b=>{
+      const meta = boatsCfgById.get(b.id);
+      if(meta && meta.name) b.name = meta.name;
+    });
+
+    const dayList = Array.from({length:7},(_,i)=> addDays(rangeStartInTz,i));
+    const dayYMD = dayList.map(d=> isoDateInTZ(d, TZ));
+
+    const occupancy = computeOccupancy(boats, dayYMD, openHM, closeHM);
+    const priceAt = createSheetPriceCalculator(pricing, occupancy);
+
+    function statusFor(events, slotStart, slotEnd){ return makeStatus(events, slotStart, slotEnd); }
+
+    const sunsetBefore = Number(cfg.sunsetWindowBefore||0);
+    const sunsetAfter  = Number(cfg.sunsetWindowAfter||0);
+    function inSunsetWindow(dt){
+      if(!sunsetsMap) return false;
+      const ymd = isoDateInTZ(dt, TZ);
+      const ss = sunsetsMap.get(ymd); if(!ss) return false;
+      const mins = dt.getHours()*60 + dt.getMinutes();
+      return mins >= (ss.mins - sunsetBefore) && mins < (ss.mins + sunsetAfter);
+    }
+
+    function HourlyDay(dayYMD){
+      const rows=[];
+      const openM = hmToMinutes(openHM);
+      const closeMRaw = hmToMinutes(closeHM);
+      const step=slotMins;
+      const totalMinutes = minutesDiffWrap(openM, closeMRaw);
+      let minutesCursor = openM;
+      let steps = Math.ceil(totalMinutes/step);
+      for(let n=0;n<steps;n++){
+        const minuteValue = (openM + n*step) % (24*60);
+        const nextMinuteValue = (minuteValue + step) % (24*60);
+        const slotStart = dateAtMinutes(dayYMD, minuteValue);
+        let slotEnd = new Date(slotStart.getTime() + step*60000);
+        const h12=((Math.floor(minuteValue/60)+11)%12)+1;
+        const mm=minuteValue%60;
+        const labelCore = mm===0 ? `${h12} ${minuteValue<720?'AM':'PM'}` : `${h12}:${String(mm).padStart(2,'0')} ${minuteValue<720?'AM':'PM'}`;
+        const cells = boats.map(b=>{
+          const st = statusFor(b.events||[], slotStart, slotEnd);
+          const price = st==='free'? priceAt(b.id, slotStart) : null;
+          return {id:b.id, status: st, price};
+        });
+        const isTodayDubai = (dayYMD===nowYMD);
+        const minsNow = minuteValue;
+        const isNow = isTodayDubai && (minsNow <= nowMinutes) && (nowMinutes < minsNow + step);
+        const inSun = sunsetsMap ? inSunsetWindow(slotStart) : false;
+        rows.push({label: labelCore, cells, sunset: inSun, now: isNow});
+      }
+      return rows;
+    }
+
+    function DayHeader(d){
+      const todayIso = isoDateInTZ(new Date(), TZ);
+      const isToday = todayIso === isoDateInTZ(d, TZ);
+      return `<div class="${window.innerWidth<420? 'text-xl' : 'text-base'} font-semibold ${isToday? 'text-blue-700':'text-gray-700'}">${fmt(d,{weekday:'short'})} <span class="opacity-70">${fmt(d,{day:'2-digit',month:'short'})}</span></div>`;
+    }
+
+    const isSmall = window.innerWidth < 420;
+    const gridTimeCol = isSmall? 64 : 90;
+    const gridLineCol = isSmall? 4 : 8;
+    const gridGap = isSmall? 8 : 12;
+    const rowH = isSmall? 28 : 36;
+
+    const weekEnd = addDays(rangeStartInTz,6);
+    const header = `
+      <div class="flex flex-col items-center gap-2 mb-4 text-center">
+        <h1 class="font-semibold tracking-tight text-2xl">Imperial Yachting</h1>
+        <p class="text-sm text-gray-600">Intervals • ${labelPrefix}${fmt(rangeStartInTz,{month:'short',day:'2-digit'})} — ${fmt(weekEnd,{month:'short',day:'2-digit'})} • ${TZ}</p>
+        <div class="flex items-center gap-2">
+          <button class="px-3 py-2 rounded-xl bg-white shadow" onclick="weekOffset--; render()">←</button>
+          <button class="px-3 py-2 rounded-xl bg-white shadow" onclick="weekOffset++; render()">→</button>
+          <button class="px-3 py-2 rounded-xl bg-indigo-600 text-white shadow" onclick="forceRefresh()">Refresh</button>
+        </div>
+      </div>`;
+
+    const content = dayYMD.map((ymd,i)=>{
+      const rows = HourlyDay(ymd);
+      const boatNames = boats.map(b=> boatsCfgById.get(b.id)?.name || b.name || b.id);
+      return `
+        <div class="bg-white rounded-2xl shadow p-3 mb-3">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2">${DayHeader(dayList[i])}</div>
+          </div>
+          <div class="grid" style="grid-template-columns:${gridLineCol}px ${gridTimeCol}px ${boats.length? 'repeat('+boats.length+', 1fr)' : ''}; gap:${gridGap}px; align-items:center; grid-auto-rows:auto;">
+            <div></div><div></div>
+            ${boatNames.map(n=> `<div class=\"${isSmall?'text-sm':'text-sm'} font-semibold text-gray-700 text-center pb-1\">${n}</div>`).join('')}
+            ${rows.map(r=> `
+              <div style="height:${rowH}px; position:relative; display:flex; align-items:center; justify-content:center;">
+                ${r.sunset? `<div style=\"position:absolute; width:${isSmall?2:3}px; height:100%; background:#f59e0b; border-radius:9999px\"></div>` : ''}
+                ${r.now? '<div style=\"width:6px; height:6px; background:#3b82f6; border-radius:9999px; box-shadow:0 0 0 2px rgba(255,255,255,0.85)\"></div>' : ''}
+              </div>
+              <div class="${isSmall?'text-base':'text-sm'} text-gray-700 tn-nums text-right ${isSmall?'pr-2':'pr-3'} flex items-center justify-end" style="height:${rowH}px;">${r.label}</div>
+              ${r.cells.map(c=> c.status==='free' ? `<div class=\"w-full rounded-lg bg-green-100 text-green-900 ${isSmall?'text-[11px]':'text-xs'} flex items-center justify-center\" style=\"height:${rowH}px\">${c.price ?? '—'} AED</div>` : (c.status==='busy'? `<div class=\"w-full rounded-lg bg-red-300/80 text-[11px] text-red-900 flex items-center justify-center\" style=\"height:${rowH}px\">Busy</div>` : `<div class=\"w-full ${isSmall?'text-[11px]':'text-xs'} text-gray-300 flex items-center justify-center\" style=\"height:${rowH}px\">—</div>`)).join('')}
+            `).join('')}
+          </div>
+        </div>`;
+    }).join('');
+
+    app.innerHTML = header + `<div class="mx-auto ${isSmall?'max-w-sm':'max-w-4xl'}">` + content + `</div>`;
+  }
+
+  async function forceRefresh(){
+    const cfg=await loadConfig();
+    const baseToday=new Date();
+    const rangeStartInTz = addDays(baseToday, 7*weekOffset);
+    const startYMD = isoDateInTZ(rangeStartInTz, TZ);
+    const key=`yachtCalendarCache|combined|${cfg.endpointUrl}|${startYMD}`;
+    try{ localStorage.removeItem(key); }catch{}
+    render();
+  }
+
+  render();
+  </script>
+</body>
+</html>

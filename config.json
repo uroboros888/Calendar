@@ -1,11 +1,17 @@
 {
   "endpointUrl": "https://script.google.com/macros/s/AKfycbwKj5564y7ek86sec9762IhmxI5dDTjH4mXI10RSAn4A_WCuDCpj13E4sWC1fFhVyxNYA/exec",
+  "pricingEndpointUrl": "https://script.google.com/macros/s/AKfycbwLeZG4RYwCEf_0SQCg5R4mjC8HUXLjkVob-SlI_kyviSpIIIZLvKF1UBv8uzPSmMwm/exec",
+  "useSheetConfig": true,
   "open": "08:00",
   "close": "24:00",
   "slotMins": 60,
   "useDemo": false,
+  "useTestCalendars": false,
   "demoSeedA": 42,
   "demoSeedB": 99,
+  "showBusyDebug": true,
+  "occupancyMode": "day",
+  "occupancyAroundDays": 1,
   "boats": [
     { "id": "A", "name": "Van Dutch 40", "baseRate": 800 },
     { "id": "B", "name": "Monte Carlo 60", "baseRate": 1400 }

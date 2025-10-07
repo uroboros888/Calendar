@@ -12,9 +12,26 @@
 function doGet(e) {
   var mode = (e && e.parameter && e.parameter.mode) || 'events';
   var callback = e && e.parameter && e.parameter.callback;
+  var params = (e && e.parameter) || {};
   try {
     if (mode === 'pricing') {
-      var pricingOnly = loadPricingConfig_();
+      var pricingOnly = loadPricingConfig_({
+        sheetId: params.sheetId || params.sheet || null
+      });
+      try {
+        logVisit_({
+          sheetId: params.sheetId || params.sheet || null,
+          mode: 'pricing',
+          tz: (e && e.parameter && e.parameter.tz) || (PropertiesService.getScriptProperties().getProperty('CALENDAR_TZ') || 'Asia/Dubai'),
+          start: params.start || '',
+          end: params.end || '',
+          test: String(params.test||'').toLowerCase()==='1' || String(params.env||'').toLowerCase()==='test',
+          client: params.client || '',
+          uid: params.uid || '',
+          ua: params.ua || '',
+          user: params.user || params.u || ''
+        });
+      } catch (ignore) {}
       return json_(pricingOnly, callback);
     }
 
@@ -26,10 +43,44 @@ function doGet(e) {
     }
 
     var range = makeRangeFromYMD(startYMD, endYMD, tz);
-    var boats = getBoatsConfig();
-    var pricing = (mode === 'combined') ? loadPricingConfig_() : null;
+    // Determine test mode: query param wins; else read from Config sheet (useTestCalendars)
+    var testParam = String(params.test||'').toLowerCase()==='1' || String(params.env||'').toLowerCase()==='test';
+    var testFromSheet = false;
+    if (!testParam) {
+      try {
+        var ssCfg = openPricingSpreadsheet_(params.sheetId || params.sheet || null);
+        var cfgMap = readConfigMap_(ssCfg);
+        testFromSheet = cfgMap && cfgMap.usetestcalendars === true;
+      } catch (err) {}
+    }
+    var boats = getBoatsConfig({
+      testMode: testParam || testFromSheet,
+      calA: params.calA || null,
+      calB: params.calB || null,
+      calAName: params.calAName || null,
+      calBName: params.calBName || null
+    });
+    var pricing = (mode === 'combined') ? loadPricingConfig_({
+      sheetId: params.sheetId || params.sheet || null
+    }) : null;
     var nameOverrides = pricing ? pricing._nameById : null;
     var eventsPayload = buildEventsPayload_(boats, range, tz, nameOverrides);
+
+    try {
+      logVisit_({
+        sheetId: params.sheetId || params.sheet || null,
+        mode: mode,
+        tz: tz,
+        start: startYMD,
+        end: endYMD,
+        test: String(params.test||'').toLowerCase()==='1' || String(params.env||'').toLowerCase()==='test',
+        client: params.client || '',
+        uid: params.uid || '',
+        ua: params.ua || '',
+        user: params.user || params.u || '',
+        boats: boats
+      });
+    } catch (ignore) {}
 
     if (mode === 'combined') {
       delete pricing._nameById;
@@ -70,8 +121,11 @@ function buildEventsPayload_(boats, range, tz, nameOverrides) {
   return out;
 }
 
-function loadPricingConfig_() {
-  var sheet = SpreadsheetApp.getActive().getSheetByName('Pricing');
+function loadPricingConfig_(opts) {
+  var propsAll = PropertiesService.getScriptProperties().getProperties();
+  var pricingSheetId = (opts && opts.sheetId) || propsAll.PRICING_SHEET_ID;
+  var ss = pricingSheetId ? SpreadsheetApp.openById(pricingSheetId) : SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName('Pricing');
   if (!sheet) {
     throw new Error('Sheet "Pricing" not found');
   }
@@ -190,10 +244,20 @@ function loadPricingConfig_() {
     });
   }
   var props = PropertiesService.getScriptProperties().getProperties();
+  var tz = props.CALENDAR_TZ || 'Asia/Dubai';
+  // Defaults from script properties
   var openTime = props.OPEN_TIME || '08:00';
   var closeTime = props.CLOSE_TIME || '24:00';
   var slotMins = Number(props.SLOT_MINS || 60);
-  var tz = props.CALENDAR_TZ || 'Asia/Dubai';
+  // Optional overrides from Config sheet
+  try {
+    var cfgMap = readConfigMap_(ss);
+    if (cfgMap) {
+      if (cfgMap.open_hm) openTime = cfgMap.open_hm;
+      if (cfgMap.close_hm) closeTime = cfgMap.close_hm;
+      if (typeof cfgMap.slotmins === 'number' && !isNaN(cfgMap.slotmins)) slotMins = Number(cfgMap.slotmins);
+    }
+  } catch (err) {}
   var defaultRoundTo = props.DEFAULT_ROUND_TO ? Number(props.DEFAULT_ROUND_TO) : null;
   if ((!defaultRoundTo || isNaN(defaultRoundTo)) && boats.length) {
     for (var idx = 0; idx < boats.length; idx++) {
@@ -218,9 +282,105 @@ function loadPricingConfig_() {
     dowMultipliers: dowMultipliers,
     busyLevels: busyLevels,
     defaultRoundTo: defaultRoundTo,
+    // UI/config hints from Config sheet (if present)
+    useTestCalendars: (cfgMap && cfgMap.usetestcalendars) === true,
+    showBusyDebug: (cfgMap && cfgMap.showbusydebug) === true,
+    occupancyMode: (cfgMap && cfgMap.occupancymode) || null,
+    occupancyAroundDays: (cfgMap && (cfgMap.occupancyarounddays !== undefined)) ? cfgMap.occupancyarounddays : null,
+    occupancyHorizonDays: (cfgMap && (cfgMap.occupancyhorizondays !== undefined)) ? cfgMap.occupancyhorizondays : null,
+    occupancyFarMultiplier: (cfgMap && (cfgMap.occupancyfarmultiplier !== undefined)) ? cfgMap.occupancyfarmultiplier : null,
     updatedAt: new Date().toISOString(),
     _nameById: nameMap
   };
+}
+
+function openPricingSpreadsheet_(sheetIdOpt) {
+  var propsAll = PropertiesService.getScriptProperties().getProperties();
+  var pricingSheetId = sheetIdOpt || propsAll.PRICING_SHEET_ID;
+  return pricingSheetId ? SpreadsheetApp.openById(pricingSheetId) : SpreadsheetApp.getActive();
+}
+
+function readConfigMap_(ss) {
+  try {
+    var sh = ss.getSheetByName('Config');
+    if (!sh) {
+      // case-insensitive fallback: find sheet named 'config'
+      var sheets = ss.getSheets();
+      for (var i = 0; i < sheets.length; i++) {
+        if (String(sheets[i].getName() || '').toLowerCase() === 'config') { sh = sheets[i]; break; }
+      }
+    }
+    if (!sh) return null;
+    var range = sh.getDataRange();
+    var raw = range.getValues();
+    var display = range.getDisplayValues();
+    var out = {};
+    for (var r = 0; r < raw.length; r++) {
+      var key = String(display[r][0] || '').trim();
+      if (!key || key.toLowerCase() === 'param') continue;
+      var k = key.toLowerCase();
+      var rv = raw[r][1];
+      var dv = display[r][1];
+      if (k === 'open' || k === 'close') {
+        var tt = parseTimeCell_(rv, dv);
+        out[k === 'open' ? 'open_hm' : 'close_hm'] = tt.text;
+        continue;
+      }
+      if (k === 'slotmins' || k === 'occupancyarounddays') {
+        var num = parseNumber_(rv, dv);
+        if (!isNaN(num)) out[k] = Number(num);
+        continue;
+      }
+      if (k === 'occupancyhorizondays' || k === 'occupancyfarmultiplier') {
+        var num2 = parseNumber_(rv, dv);
+        if (!isNaN(num2)) out[k] = Number(num2);
+        continue;
+      }
+      if (k === 'usetestcalendars' || k === 'showbusydebug') {
+        var s = String(dv || rv || '').toLowerCase();
+        out[k] = (s === 'true' || s === '1' || s === 'yes');
+        continue;
+      }
+      if (k === 'occupancymode') {
+        var val = String(dv || rv || '').trim().toLowerCase();
+        if (val) out[k] = val;
+        continue;
+      }
+    }
+    return out;
+  } catch (err) {
+    return null;
+  }
+}
+
+function logVisit_(info) {
+  info = info || {};
+  var ss = openPricingSpreadsheet_(info.sheetId || null);
+  var lock = LockService.getScriptLock();
+  try { lock.tryLock(5000); } catch (e) {}
+  try {
+    var tz = info.tz || (PropertiesService.getScriptProperties().getProperty('CALENDAR_TZ') || 'Asia/Dubai');
+    var now = new Date();
+    var tsIso = Utilities.formatDate(now, tz, "yyyy-MM-dd'T'HH:mm:ss");
+    var visits = ss.getSheetByName('Visits') || ss.insertSheet('Visits');
+    if (visits.getLastRow() === 0) {
+      visits.appendRow(['ts', 'tz', 'mode', 'start', 'end', 'test', 'client', 'uid', 'user', 'ua', 'calA', 'calB']);
+    }
+    var calA = '', calB = '';
+    if (info.boats && info.boats.length) {
+      for (var i = 0; i < info.boats.length; i++) {
+        var b = info.boats[i];
+        if (b.id === 'A') calA = b.calId || '';
+        if (b.id === 'B') calB = b.calId || '';
+      }
+    }
+    visits.appendRow([tsIso, tz, info.mode || '', info.start || '', info.end || '', info.test ? 1 : 0, info.client || '', info.uid || '', info.user || '', info.ua || '', calA, calB]);
+
+    // Users sheet остаётся мастер-реестром, без автосоздания/изменений —
+    // при необходимости можно читать записи вручную отдельной функцией.
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
 }
 
 function findRowIndex_(rows, headerValue) {
@@ -366,17 +526,18 @@ function json_(obj, callback) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-function getBoatsConfig() {
+function getBoatsConfig(opts) {
+  opts = opts || {};
   var props = PropertiesService.getScriptProperties().getProperties();
-  var aId = props.CAL_A_ID, aName = props.CAL_A_NAME || 'Yacht A';
-  var bId = props.CAL_B_ID, bName = props.CAL_B_NAME || 'Yacht B';
-  if (aId && bId) {
-    return [
-      { id: 'A', name: aName, calId: aId },
-      { id: 'B', name: bName, calId: bId }
-    ];
-  }
-  return BOATS_HARDCODED;
+  var useTest = !!opts.testMode;
+  var aId = opts.calA || (useTest ? (props.TEST_CAL_A_ID || props.CAL_A_ID) : props.CAL_A_ID);
+  var bId = opts.calB || (useTest ? (props.TEST_CAL_B_ID || props.CAL_B_ID) : props.CAL_B_ID);
+  var aName = opts.calAName || (useTest ? (props.TEST_CAL_A_NAME || props.CAL_A_NAME) : props.CAL_A_NAME) || 'Yacht A';
+  var bName = opts.calBName || (useTest ? (props.TEST_CAL_B_NAME || props.CAL_B_NAME) : props.CAL_B_NAME) || 'Yacht B';
+  var boats = [];
+  if (aId) boats.push({ id: 'A', name: aName, calId: aId });
+  if (bId) boats.push({ id: 'B', name: bName, calId: bId });
+  return boats.length ? boats : BOATS_HARDCODED;
 }
 
 var BOATS_HARDCODED = [

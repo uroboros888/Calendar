@@ -53,7 +53,25 @@
     }
     const res = await fetch('config.json', {cache:'no-store'});
     if(!res.ok){ throw new Error('Failed to load config.json ('+res.status+')'); }
-    return await res.json();
+    const cfg = await res.json();
+    try{
+      const occMode = localStorage.getItem('yachtCalendarSheet.occMode');
+      if(occMode){ cfg.occupancyMode = occMode; }
+    }catch{}
+    // ensure anonymous uid for visit attribution
+    try{
+      // persistent anonymous uid
+      let uid = localStorage.getItem('yachtCalendar.uid');
+      if(!uid){ uid = (crypto && crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36)+Math.random().toString(36).slice(2,10))); localStorage.setItem('yachtCalendar.uid', uid); }
+      cfg.clientUid = uid;
+      cfg.userAgent = navigator.userAgent || '';
+      // explicit user from link (?user=...) with local persistence
+      const url = new URL(location.href);
+      const userFromUrl = url.searchParams.get('user') || url.searchParams.get('u');
+      if(userFromUrl){ localStorage.setItem('yachtCalendar.user', userFromUrl); }
+      cfg.userId = localStorage.getItem('yachtCalendar.user') || '';
+    }catch{}
+    return cfg;
   }
 
   function pad2(n){ return String(n).padStart(2,'0'); }
@@ -146,7 +164,12 @@
 
   async function fetchPricingConfig(cfg){
     const base = cfg.pricingEndpointUrl || cfg.endpointUrl;
-    const url = cfg.pricingEndpointUrl ? base : makeUrl(base, { mode: 'pricing' });
+    const extra = {};
+    if(cfg.useTestCalendars) extra.test = 1;
+    if(cfg.clientUid) extra.uid = cfg.clientUid;
+    if(cfg.userId) extra.user = cfg.userId;
+    if(cfg.userAgent) extra.ua = cfg.userAgent;
+    const url = cfg.pricingEndpointUrl ? makeUrl(base, { client:'viewer', ...extra }) : makeUrl(base, { mode: 'pricing', client:'viewer', ...extra });
     const data = shouldUseJsonp(url) ? await fetchJsonp(url) : await fetchJson(url);
     if(data && data._nameById) delete data._nameById;
     return data;
@@ -184,6 +207,21 @@
       result[b.id]={ busyMinutes, totalMinutes, ratio };
     });
     return result;
+  }
+
+  function resolveBusyInfo(levels, ratio, boatId){
+    if(!levels || !levels.length || ratio===null || ratio===undefined) return null;
+    for(const level of levels){
+      const from = typeof level.from==='number'? level.from : Number(level.from)||0;
+      const toRaw = level.to;
+      const to = (toRaw===null || toRaw===undefined || toRaw==='') ? null : Number(toRaw);
+      const inRange = ratio >= from && (to===null ? ratio <= 1 : ratio <= to + 1e-9);
+      if(inRange){
+        const mult = level.multipliers && (level.multipliers[boatId] ?? level.multipliers['*'] ?? level.multipliers.default);
+        return { from, to, mult: (isFinite(mult)&&!isNaN(mult))? Number(mult): null };
+      }
+    }
+    return null;
   }
 
   function resolveBandMultiplier(bands, minute, boatId){
@@ -229,7 +267,7 @@
     return 1;
   }
 
-  function createSheetPriceCalculator(pricing, occupancy){
+  function createSheetPriceCalculator(pricing, occupancy, opts){
     const boatsMap = new Map();
     (pricing.boats||[]).forEach(b=>{
       boatsMap.set(b.id, {
@@ -255,16 +293,55 @@
     }));
     const defaultRound = pricing.defaultRoundTo ? Number(pricing.defaultRoundTo) : null;
 
+    // find optional dynamic 'sunset' band by label
+    const sunsetBand = (pricing.bands||[]).find(b=> String(b.label||b.name||'').trim().toLowerCase()==='sunset');
+    function bandMultiplierFor(band, boatId){
+      const multipliers = band && band.multipliers || {};
+      const val = multipliers[boatId] ?? multipliers['*'] ?? multipliers.default;
+      return (isFinite(val) && !isNaN(val)) ? Number(val) : 1;
+    }
+
+    function daysAheadFromToday(slotDate){
+      try{
+        const slotYmd = isoDateInTZ(slotDate, TZ);
+        const a = slotYmd.split('-').map(Number);
+        const b = String(opts && opts.todayYMD || isoDateInTZ(new Date(), TZ)).split('-').map(Number);
+        const da = Date.UTC(a[0], a[1]-1, a[2]);
+        const db = Date.UTC(b[0], b[1]-1, b[2]);
+        return Math.round((da - db)/86400000);
+      }catch{return 0;}
+    }
+
     return (boatId, slotStart)=>{
       const boat = boatsMap.get(boatId);
       if(!boat || !boat.baseRate) return null;
       const parts = zonedDateParts(slotStart, TZ);
       const minute = parts.h*60 + parts.mi;
       const dowKey = DOW_SHORT_TO_KEY[parts.wd] || null;
-      const occ = occupancy[boatId];
-      const bandMult = resolveBandMultiplier(bands, minute, boatId);
+      const occRatio = (opts && typeof opts.getOccupancyRatio==='function')
+        ? opts.getOccupancyRatio(boatId, slotStart)
+        : (occupancy && occupancy[boatId] ? occupancy[boatId].ratio : null);
+      let bandMult;
+      if(opts && typeof opts.inSunsetWindow==='function' && opts.inSunsetWindow(slotStart) && sunsetBand){
+        bandMult = bandMultiplierFor(sunsetBand, boatId);
+      } else {
+        bandMult = resolveBandMultiplier(bands, minute, boatId);
+      }
       const dowMult = resolveDowMultiplier(dowMap, dowKey, boatId);
-      const busyMult = resolveBusyMultiplier(busyLevels, occ? occ.ratio : null, boatId);
+      let busyMult;
+      const horizon = (opts && isFinite(opts.occupancyHorizonDays)) ? Number(opts.occupancyHorizonDays) : null;
+      const far = (opts && isFinite(opts.occupancyFarMultiplier)) ? Number(opts.occupancyFarMultiplier) : 1;
+      if(horizon!==null){
+        if(horizon <= 0){
+          busyMult = far; // apply fixed multiplier for all days when horizon=0
+        }else if(daysAheadFromToday(slotStart) > horizon){
+          busyMult = far;
+        }else{
+          busyMult = resolveBusyMultiplier(busyLevels, occRatio, boatId);
+        }
+      }else{
+        busyMult = resolveBusyMultiplier(busyLevels, occRatio, boatId);
+      }
       let price = boat.baseRate * bandMult * dowMult * busyMult;
       if(isFinite(boat.minRate) && boat.minRate!==null){ price = Math.max(boat.minRate, price); }
       if(isFinite(boat.maxRate) && boat.maxRate!==null && boat.maxRate>0){ price = Math.min(boat.maxRate, price); }
@@ -283,7 +360,7 @@
 
   async function render(){
     const cfg=await loadConfig();
-    log('cfg.endpoint', cfg.endpointUrl);
+    log('cfg.endpoint', cfg.endpointUrl, 'pricingEndpoint', cfg.pricingEndpointUrl||'(none)');
 
     const baseToday = new Date();
     const nowP = zonedDateParts(baseToday, TZ);
@@ -312,7 +389,8 @@
       }catch(err){ log('sunsets load failed', err); }
     }
 
-    const key=`yachtCalendarCache|combined|${cfg.endpointUrl}|${startYMD}`;
+    const baseCombined = cfg.pricingEndpointUrl || cfg.endpointUrl;
+    const key=`yachtCalendarCache|combined|${baseCombined}|${startYMD}`;
     let data=null; let pricing=null; let labelPrefix='';
 
     if(cfg.useDemo){
@@ -335,8 +413,13 @@
       if(!data){
         app.innerHTML = `<div class="text-center text-sm text-gray-600">Loading ${startYMD}…</div>`;
         try{
-          const url = makeUrl(cfg.endpointUrl, { start:startYMD, end:endYMD, tz:TZ, mode:'combined' });
-          const useJsonp = shouldUseJsonp(cfg.endpointUrl);
+          const extra = {};
+          if(cfg.useTestCalendars) extra.test = 1;
+          if(cfg.clientUid) extra.uid = cfg.clientUid;
+          if(cfg.userId) extra.user = cfg.userId;
+          if(cfg.userAgent) extra.ua = cfg.userAgent;
+          const url = makeUrl(baseCombined, { start:startYMD, end:endYMD, tz:TZ, mode:'combined', client:'viewer', ...extra });
+          const useJsonp = shouldUseJsonp(baseCombined);
           log('fetch url', url, 'mode', useJsonp? 'jsonp':'fetch');
           data = useJsonp ? await fetchJsonp(url) : await fetchJson(url);
           cacheSet(key, data);
@@ -360,9 +443,25 @@
     }
     if(pricing._nameById) delete pricing._nameById;
 
-    const openHM = pricing.open || cfg.open || '08:00';
-    const closeHM = pricing.close || cfg.close || '24:00';
-    const slotMins = Number(pricing.slotMins || cfg.slotMins || 60);
+    const useSheetCfg = !!cfg.useSheetConfig;
+    const openHM = useSheetCfg ? (pricing.open || cfg.open || '08:00') : (cfg.open || pricing.open || '08:00');
+    const closeHM = useSheetCfg ? (pricing.close || cfg.close || '24:00') : (cfg.close || pricing.close || '24:00');
+    const slotMins = Number(useSheetCfg ? (pricing.slotMins || cfg.slotMins || 60) : (cfg.slotMins || pricing.slotMins || 60));
+
+    // Merge UI/debug flags from sheet config if provided
+    if(useSheetCfg && typeof pricing.showBusyDebug !== 'undefined') cfg.showBusyDebug = !!pricing.showBusyDebug;
+    if(useSheetCfg && typeof pricing.occupancyMode === 'string' && !localStorage.getItem('yachtCalendarSheet.occMode')){
+      cfg.occupancyMode = pricing.occupancyMode;
+    }
+    if(useSheetCfg && typeof pricing.occupancyAroundDays !== 'undefined' && pricing.occupancyAroundDays!==null){
+      cfg.occupancyAroundDays = Number(pricing.occupancyAroundDays);
+    }
+    if(useSheetCfg && typeof pricing.occupancyHorizonDays !== 'undefined' && pricing.occupancyHorizonDays!==null){
+      cfg.occupancyHorizonDays = Number(pricing.occupancyHorizonDays);
+    }
+    if(useSheetCfg && typeof pricing.occupancyFarMultiplier !== 'undefined' && pricing.occupancyFarMultiplier!==null){
+      cfg.occupancyFarMultiplier = Number(pricing.occupancyFarMultiplier);
+    }
 
     const boatsCfgById = new Map((pricing.boats||[]).map(b=> [b.id, b]));
     const boats = (data.boats || []).filter(b=> boatsCfgById.has(b.id));
@@ -374,10 +473,20 @@
     const dayList = Array.from({length:7},(_,i)=> addDays(rangeStartInTz,i));
     const dayYMD = dayList.map(d=> isoDateInTZ(d, TZ));
 
-    const occupancy = computeOccupancy(boats, dayYMD, openHM, closeHM);
-    const priceAt = createSheetPriceCalculator(pricing, occupancy);
-
-    function statusFor(events, slotStart, slotEnd){ return makeStatus(events, slotStart, slotEnd); }
+    // Occupancy window selection
+    const occMode = (cfg.occupancyMode||'week'); // 'day' | 'around' | 'week'
+    const aroundDays = Number(cfg.occupancyAroundDays||1);
+    const occWeek = computeOccupancy(boats, dayYMD, openHM, closeHM);
+    const occByDay = new Array(7);
+    for(let i=0;i<7;i++){
+      if(occMode==='week') { occByDay[i] = occWeek; continue; }
+      if(occMode==='day') { occByDay[i] = computeOccupancy(boats, [dayYMD[i]], openHM, closeHM); continue; }
+      // around ±N days (clamped to the week)
+      const start = Math.max(0, i - aroundDays);
+      const end = Math.min(6, i + aroundDays);
+      const slice = dayYMD.slice(start, end+1);
+      occByDay[i] = computeOccupancy(boats, slice, openHM, closeHM);
+    }
 
     const sunsetBefore = Number(cfg.sunsetWindowBefore||0);
     const sunsetAfter  = Number(cfg.sunsetWindowAfter||0);
@@ -388,6 +497,22 @@
       const mins = dt.getHours()*60 + dt.getMinutes();
       return mins >= (ss.mins - sunsetBefore) && mins < (ss.mins + sunsetAfter);
     }
+
+    const priceAt = createSheetPriceCalculator(pricing, null, {
+      inSunsetWindow,
+      getOccupancyRatio: (boatId, slotStart)=>{
+        const ymd = isoDateInTZ(slotStart, TZ);
+        const idx = dayYMD.indexOf(ymd);
+        const occ = (idx>=0? occByDay[idx] : occWeek) || occWeek;
+        const rec = occ && occ[boatId];
+        return rec? rec.ratio : null;
+      },
+      todayYMD: nowYMD,
+      occupancyHorizonDays: (cfg.occupancyHorizonDays!==undefined? Number(cfg.occupancyHorizonDays) : undefined),
+      occupancyFarMultiplier: (cfg.occupancyFarMultiplier!==undefined? Number(cfg.occupancyFarMultiplier) : undefined)
+    });
+
+    function statusFor(events, slotStart, slotEnd){ return makeStatus(events, slotStart, slotEnd); }
 
     function HourlyDay(dayYMD){
       const rows=[];
@@ -419,10 +544,45 @@
       return rows;
     }
 
-    function DayHeader(d){
+    function DayHeader(d, i){
       const todayIso = isoDateInTZ(new Date(), TZ);
       const isToday = todayIso === isoDateInTZ(d, TZ);
-      return `<div class="${window.innerWidth<420? 'text-xl' : 'text-base'} font-semibold ${isToday? 'text-blue-700':'text-gray-700'}">${fmt(d,{weekday:'short'})} <span class="opacity-70">${fmt(d,{day:'2-digit',month:'short'})}</span></div>`;
+      let dbg='';
+      try{
+        const showDbg = !!cfg.showBusyDebug;
+        if(showDbg){
+          const ymd = isoDateInTZ(d, TZ);
+          const occ = occByDay[i] || occWeek;
+          const parts=[];
+          (boats||[]).forEach(b=>{
+            const o = occ && occ[b.id];
+            const r = o? Math.round((o.ratio||0)*100) : null;
+            const info = resolveBusyInfo(pricing.busyLevels||[], o? o.ratio : null, b.id);
+            const mult = info && info.mult ? info.mult.toFixed(2) : '—';
+            const label = (r!==null? (r+'%') : '—')+` ×${mult}`;
+            parts.push(`${b.name||b.id}: ${label}`);
+          });
+          // Pricing type: dynamic (within horizon) or normal (beyond)
+          let typeLabel = 'динамический';
+          const horizon = Number(cfg.occupancyHorizonDays);
+          if(Number.isFinite(horizon)){
+            try{
+              if(horizon <= 0){
+                typeLabel = 'нормальный';
+              } else {
+                const nowP = todayIso.split('-').map(Number);
+                const dP = ymd.split('-').map(Number);
+                const daysAhead = Math.round((Date.UTC(dP[0], dP[1]-1, dP[2]) - Date.UTC(nowP[0], nowP[1]-1, nowP[2]))/86400000);
+                if(daysAhead > horizon) typeLabel = 'нормальный';
+              }
+            }catch{}
+          }
+          const typeStr = `тип: ${typeLabel}`;
+          const modeLabel = (occMode==='day'? 'day' : (occMode==='around'? `±${aroundDays}d` : 'week'));
+          dbg = `<div class="text-[10px] text-gray-500">${typeStr} • occ: ${modeLabel} • ${parts.join(' • ')}</div>`;
+        }
+      }catch{}
+      return `<div class="${window.innerWidth<420? 'text-xl' : 'text-base'} font-semibold ${isToday? 'text-blue-700':'text-gray-700'}">${fmt(d,{weekday:'short'})} <span class="opacity-70">${fmt(d,{day:'2-digit',month:'short'})}</span></div>${dbg}`;
     }
 
     const isSmall = window.innerWidth < 420;
@@ -432,6 +592,7 @@
     const rowH = isSmall? 28 : 36;
 
     const weekEnd = addDays(rangeStartInTz,6);
+    const occModeSel = (m)=> m===(cfg.occupancyMode||'week')? 'selected' : '';
     const header = `
       <div class="flex flex-col items-center gap-2 mb-4 text-center">
         <h1 class="font-semibold tracking-tight text-2xl">Imperial Yachting</h1>
@@ -440,6 +601,14 @@
           <button class="px-3 py-2 rounded-xl bg-white shadow" onclick="weekOffset--; render()">←</button>
           <button class="px-3 py-2 rounded-xl bg-white shadow" onclick="weekOffset++; render()">→</button>
           <button class="px-3 py-2 rounded-xl bg-indigo-600 text-white shadow" onclick="forceRefresh()">Refresh</button>
+          <div class="hidden sm:flex items-center gap-2 text-xs text-gray-600 ml-2">
+            <label>Occupancy:</label>
+            <select onchange="(function(s){ try{ const v=s.value; localStorage.setItem('yachtCalendarSheet.occMode', v);}catch{}; render(); })(this)" class="border rounded px-2 py-1 bg-white">
+              <option value="day" ${occModeSel('day')}>Day</option>
+              <option value="around" ${occModeSel('around')}>±1 day</option>
+              <option value="week" ${occModeSel('week')}>Week</option>
+            </select>
+          </div>
         </div>
       </div>`;
 
@@ -449,7 +618,7 @@
       return `
         <div class="bg-white rounded-2xl shadow p-3 mb-3">
           <div class="flex items-center justify-between mb-3">
-            <div class="flex items-center gap-2">${DayHeader(dayList[i])}</div>
+            <div class="flex items-center gap-2">${DayHeader(dayList[i], i)}</div>
           </div>
           <div class="grid" style="grid-template-columns:${gridLineCol}px ${gridTimeCol}px ${boats.length? 'repeat('+boats.length+', 1fr)' : ''}; gap:${gridGap}px; align-items:center; grid-auto-rows:auto;">
             <div></div><div></div>
@@ -474,7 +643,8 @@
     const baseToday=new Date();
     const rangeStartInTz = addDays(baseToday, 7*weekOffset);
     const startYMD = isoDateInTZ(rangeStartInTz, TZ);
-    const key=`yachtCalendarCache|combined|${cfg.endpointUrl}|${startYMD}`;
+    const baseCombined = cfg.pricingEndpointUrl || cfg.endpointUrl;
+    const key=`yachtCalendarCache|combined|${baseCombined}|${startYMD}`;
     try{ localStorage.removeItem(key); }catch{}
     render();
   }

@@ -16,7 +16,8 @@ function doGet(e) {
   try {
     if (mode === 'pricing') {
       var pricingOnly = loadPricingConfig_({
-        sheetId: params.sheetId || params.sheet || null
+        sheetId: params.sheetId || params.sheet || null,
+        user: params.user || params.u || ''
       });
       try {
         logVisit_({
@@ -61,7 +62,8 @@ function doGet(e) {
       calBName: params.calBName || null
     });
     var pricing = (mode === 'combined') ? loadPricingConfig_({
-      sheetId: params.sheetId || params.sheet || null
+      sheetId: params.sheetId || params.sheet || null,
+      user: params.user || params.u || ''
     }) : null;
     var nameOverrides = pricing ? pricing._nameById : null;
     var eventsPayload = buildEventsPayload_(boats, range, tz, nameOverrides);
@@ -252,7 +254,7 @@ function loadPricingConfig_(opts) {
   // Optional overrides from Config sheet
   try {
     var cfgMap = readConfigMap_(ss);
-    if (cfgMap) {
+  if (cfgMap) {
       if (cfgMap.open_hm) openTime = cfgMap.open_hm;
       if (cfgMap.close_hm) closeTime = cfgMap.close_hm;
       if (typeof cfgMap.slotmins === 'number' && !isNaN(cfgMap.slotmins)) slotMins = Number(cfgMap.slotmins);
@@ -272,6 +274,11 @@ function loadPricingConfig_(opts) {
   boats.forEach(function (b) {
     nameMap[b.id] = b.name;
   });
+  // Determine pricing method per user (dynamic|normal) from Users sheet
+  var userId = opts && opts.user ? String(opts.user).trim() : '';
+  var userPolicy = readUserPolicy_(ss, userId);
+  // Load special dates from sheet 'Special_DT' if present
+  var specialDates = loadSpecialDates_(ss, boats, tz);
   return {
     timezone: tz,
     open: openTime,
@@ -282,6 +289,7 @@ function loadPricingConfig_(opts) {
     dowMultipliers: dowMultipliers,
     busyLevels: busyLevels,
     defaultRoundTo: defaultRoundTo,
+    specialDates: specialDates,
     // UI/config hints from Config sheet (if present)
     useTestCalendars: (cfgMap && cfgMap.usetestcalendars) === true,
     showBusyDebug: (cfgMap && cfgMap.showbusydebug) === true,
@@ -289,6 +297,8 @@ function loadPricingConfig_(opts) {
     occupancyAroundDays: (cfgMap && (cfgMap.occupancyarounddays !== undefined)) ? cfgMap.occupancyarounddays : null,
     occupancyHorizonDays: (cfgMap && (cfgMap.occupancyhorizondays !== undefined)) ? cfgMap.occupancyhorizondays : null,
     occupancyFarMultiplier: (cfgMap && (cfgMap.occupancyfarmultiplier !== undefined)) ? cfgMap.occupancyfarmultiplier : null,
+    dowMinOcc: (cfgMap && (cfgMap.dowminocc !== undefined)) ? cfgMap.dowminocc : null,
+    pricingMethod: userPolicy && userPolicy.pricingMethod ? userPolicy.pricingMethod : (userId? 'normal':'normal'),
     updatedAt: new Date().toISOString(),
     _nameById: nameMap
   };
@@ -336,6 +346,11 @@ function readConfigMap_(ss) {
         if (!isNaN(num2)) out[k] = Number(num2);
         continue;
       }
+      if (k === 'dowminocc' || k === 'dowminocc%') {
+        var p = parsePercent_(rv, dv);
+        if (p !== null) out['dowminocc'] = p;
+        continue;
+      }
       if (k === 'usetestcalendars' || k === 'showbusydebug') {
         var s = String(dv || rv || '').toLowerCase();
         out[k] = (s === 'true' || s === '1' || s === 'yes');
@@ -351,6 +366,160 @@ function readConfigMap_(ss) {
   } catch (err) {
     return null;
   }
+}
+
+function readUserPolicy_(ss, userId) {
+  try {
+    if (!userId) return { pricingMethod: 'normal' };
+    var sh = ss.getSheetByName('Users');
+    if (!sh) return { pricingMethod: 'normal' };
+    var data = sh.getDataRange().getValues();
+    if (!data || data.length < 2) return { pricingMethod: 'normal' };
+    var header = data[0].map(function (h) { return String(h || '').trim().toLowerCase(); });
+    function col(name) { var idx = header.indexOf(name.toLowerCase()); return idx >= 0 ? idx : -1; }
+    var cId = col('id');
+    var cUser = col('user');
+    var cPricing = col('pricing');
+    var found = null;
+    for (var r = 1; r < data.length; r++) {
+      var row = data[r];
+      var idMatch = (cId>=0 && String(row[cId]).trim() === userId);
+      var userMatch = (cUser>=0 && String(row[cUser]).trim().toLowerCase() === userId.toLowerCase());
+      if (idMatch || userMatch) { found = row; break; }
+    }
+    if (!found) return { pricingMethod: 'normal' };
+    var allowDynamic = false;
+    if (cPricing >= 0) {
+      var val = String(found[cPricing]).trim().toLowerCase();
+      allowDynamic = (val === 'true' || val === '1' || val === 'yes');
+    }
+    return { pricingMethod: allowDynamic ? 'dynamic' : 'normal' };
+  } catch (e) {
+    return { pricingMethod: 'normal' };
+  }
+}
+
+function loadSpecialDates_(ss, boats, tz) {
+  try {
+    var sh = ss.getSheetByName('Special_DT');
+    if (!sh) {
+      // case-insensitive fallback
+      var sheets = ss.getSheets();
+      for (var i = 0; i < sheets.length; i++) {
+        if (String(sheets[i].getName() || '').toLowerCase() === 'special_dt') { sh = sheets[i]; break; }
+      }
+    }
+    if (!sh) return {};
+    var range = sh.getDataRange();
+    var raw = range.getValues();
+    var display = range.getDisplayValues();
+    if (!raw || !raw.length) return {};
+    // Header indices by name
+    var header = raw[0].map(function (h) { return String(h || '').trim().toLowerCase(); });
+    function col(name) { var idx = header.indexOf(name.toLowerCase()); return idx >= 0 ? idx : -1; }
+    var cDate = col('date');
+    var cName = col('name date');
+    var cBoat = col('boat');
+    var cMin = col('min order');
+    var cMorning = col('morning');
+    var cDay = col('day');
+    var cSunset = col('sunset');
+    var cNight = col('night');
+    var c24h = col('24h');
+    var c12h = col('12h');
+    var cStart = col('start');
+    var cEnd = col('end');
+    var cType = col('type');
+    var cNote = col('note');
+    var mapByDate = {};
+    var boatIds = boats.map(function (b) { return b.id; });
+    var boatNames = {};
+    boats.forEach(function (b) { boatNames[(b.name||'').toLowerCase()] = b.id; });
+    for (var r = 1; r < raw.length; r++) {
+      var row = raw[r];
+      var disp = display[r];
+      var date = parseDateCell_(row[cDate], disp[cDate], tz);
+      if (!date) continue;
+      var name = cName>=0 ? String(row[cName]||'').trim() : '';
+      var boatRaw = cBoat>=0 ? String(row[cBoat]||'').trim() : '';
+      var boatId = normalizeBoatId_(boatRaw, boatIds, boatNames);
+      var minOrder = cMin>=0 ? normalizeNumber_(parseNumber_(row[cMin], row[cMin])) : null;
+      function numAt(ci){ return (ci>=0)? normalizeNumber_(parseNumber_(row[ci], row[ci])) : null; }
+      var morning = numAt(cMorning);
+      var day = numAt(cDay);
+      var sunset = numAt(cSunset);
+      var night = numAt(cNight);
+      var p24 = numAt(c24h);
+      var p12 = numAt(c12h);
+      function hmAt(ci){
+        if(ci<0) return null;
+        var rv = row[ci];
+        var dv = disp && disp[ci];
+        var isEmpty = (rv===null || rv===undefined || rv==='') && (!dv || String(dv).trim()==='');
+        if(isEmpty) return null;
+        var t = parseTimeCell_(rv, dv);
+        // if explicitly 00:00 but cell looked empty, we already returned null above
+        return t.text;
+      }
+      var startHM = hmAt(cStart);
+      var endHM = hmAt(cEnd);
+      var type = cType>=0 ? String(row[cType]||'').trim().toLowerCase() : '';
+      var note = cNote>=0 ? String(row[cNote]||'').trim() : '';
+      var entry = {
+        name: name,
+        boat: boatId, // null means applies to all
+        minOrder: minOrder,
+        bands: { morning: morning, day: day, sunset: sunset, night: night },
+        p24h: p24, p12h: p12,
+        start: startHM, end: endHM,
+        type: type, note: note
+      };
+      if (!mapByDate[date]) mapByDate[date] = { items: [] };
+      mapByDate[date].items.push(entry);
+    }
+    return mapByDate;
+  } catch (err) {
+    return {};
+  }
+}
+
+function normalizeBoatId_(val, knownIds, nameMap) {
+  var s = String(val||'').trim().toLowerCase();
+  if (!s) return null;
+  // direct id match
+  for (var i=0;i<knownIds.length;i++){ if (String(knownIds[i]||'').toLowerCase()===s) return knownIds[i]; }
+  // by name map
+  if (nameMap && nameMap[s]) return nameMap[s];
+  // simple aliases
+  var alias = { 'vd':'A', 'van dutch':'A', 'vandutch':'A', 'mc':'B', 'monte carlo':'B' };
+  if (alias[s]) return alias[s];
+  return null;
+}
+
+function parseDateCell_(rawValue, displayValue, tz) {
+  try {
+    if (rawValue instanceof Date) {
+      return Utilities.formatDate(rawValue, tz || 'Asia/Dubai', 'yyyy-MM-dd');
+    }
+    var s = String(displayValue || rawValue || '').trim();
+    if (!s) return null;
+    // ISO
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+    // dd.MM.yyyy or dd/MM/yyyy or dd-MM-yyyy
+    var m = s.match(/^(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{2,4})$/);
+    if (m) {
+      var dd = ('0' + Number(m[1])).slice(-2);
+      var MM = ('0' + Number(m[2])).slice(-2);
+      var yyyy = String(m[3]).length === 2 ? ('20' + m[3]) : m[3];
+      return yyyy + '-' + MM + '-' + dd;
+    }
+    // try Date.parse
+    var d = new Date(s);
+    if (!isNaN(d.getTime())) {
+      return Utilities.formatDate(d, tz || 'Asia/Dubai', 'yyyy-MM-dd');
+    }
+  } catch (e) {}
+  return null;
 }
 
 function logVisit_(info) {
@@ -415,6 +584,8 @@ function parseNumber_(rawValue, displayValue) {
   }
   var str = trim_(displayValue || rawValue);
   if (!str) return NaN;
+  // normalize thousand separators/spaces and decimal comma
+  try { str = String(str).replace(/\u00A0|\s/g, ''); } catch(e) {}
   str = str.replace(',', '.');
   var num = Number(str);
   return isNaN(num) ? NaN : num;

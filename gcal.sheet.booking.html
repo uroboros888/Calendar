@@ -3,11 +3,15 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Yacht Calendar — Viewer (Sheet Pricing)</title>
+  <title>Yacht Calendar — Viewer + Booking (Sheet Pricing)</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     html,body{height:100%}
     .tn-nums{font-variant-numeric: tabular-nums;}
+    .sheet-enter{transform:translateY(100%)}
+    .sheet-open{transform:translateY(0)}
+    .sheet{transition:transform .25s ease;}
+    .slot-selected{outline:2px solid #6366f1; outline-offset:-2px;}
   </style>
 </head>
 <body class="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100 text-gray-900">
@@ -54,19 +58,18 @@
     const res = await fetch('config.json', {cache:'no-store'});
     if(!res.ok){ throw new Error('Failed to load config.json ('+res.status+')'); }
     const cfg = await res.json();
-    // no local override for occupancy mode; server/sheet controls it
-    // ensure anonymous uid for visit attribution
     try{
-      // persistent anonymous uid
       let uid = localStorage.getItem('yachtCalendar.uid');
       if(!uid){ uid = (crypto && crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36)+Math.random().toString(36).slice(2,10))); localStorage.setItem('yachtCalendar.uid', uid); }
       cfg.clientUid = uid;
       cfg.userAgent = navigator.userAgent || '';
-      // explicit user from link (?user=...) with local persistence
       const url = new URL(location.href);
       const userFromUrl = url.searchParams.get('user') || url.searchParams.get('u');
       if(userFromUrl){ localStorage.setItem('yachtCalendar.user', userFromUrl); }
       cfg.userId = localStorage.getItem('yachtCalendar.user') || '';
+      // allowOffHours toggle via config or URL (?offhours=1)
+      const oh = url.searchParams.get('offhours');
+      if(oh==='1'){ cfg.allowOffHours = true; }
     }catch{}
     return cfg;
   }
@@ -293,7 +296,6 @@
     }));
     const defaultRound = pricing.defaultRoundTo ? Number(pricing.defaultRoundTo) : null;
 
-    // find optional dynamic 'sunset' band by label
     const sunsetBand = (pricing.bands||[]).find(b=> String(b.label||b.name||'').trim().toLowerCase()==='sunset');
     function bandMultiplierFor(band, boatId){
       const multipliers = band && band.multipliers || {};
@@ -317,10 +319,8 @@
         const ymd = isoDateInTZ(slotStart, TZ);
         const daySpec = specials && specials[ymd];
         if(!daySpec || !daySpec.items || !daySpec.items.length) return null;
-        // Find first overlay entry matching boat or global
         let entry = daySpec.items.find(it=> (String(it.type||'')==='overlay' || String(it.type||'')==='Overlay' || String(it.type||'').toLowerCase()==='overlay') && (!it.boat || it.boat===boatId));
         if(!entry) return null;
-        // If entry has time window, only apply inside it; otherwise treat as all-day
         if(entry.start || entry.end){
           const sMin = entry.start ? hmToMinutes(entry.start) : 0;
           const eMin = entry.end ? hmToMinutes(entry.end) : 24*60;
@@ -330,7 +330,6 @@
           else { inWin = (minute >= sMin) || (minute < eMin); }
           if(!inWin) return null;
         }
-        // Map minute->band key
         const bandKey = (function(){
           for(const b of bands){
             const s=Number(b.startMinutes), e=Number(b.endMinutes);
@@ -376,7 +375,7 @@
       const far = (opts && isFinite(opts.occupancyFarMultiplier)) ? Number(opts.occupancyFarMultiplier) : 1;
       if(horizon!==null){
         if(horizon <= 0){
-          busyMult = far; // apply fixed multiplier for all days when horizon=0
+          busyMult = far;
         }else if(daysAheadFromToday(slotStart) > horizon){
           busyMult = far;
         }else{
@@ -385,7 +384,6 @@
       }else{
         busyMult = resolveBusyMultiplier(busyLevels, occRatio, boatId);
       }
-      // Special overlay absolute price takes precedence
       const overlay = overlayPriceFor(boatId, slotStart, minute);
       let price; let usedOverlay=false;
       if(overlay!==null){
@@ -393,7 +391,6 @@
       } else {
         price = boat.baseRate * bandMult * dowMult * busyMult;
       }
-      // Do not clamp/round overlay absolute prices
       if(!usedOverlay){
         if(isFinite(boat.minRate) && boat.minRate!==null){ price = Math.max(boat.minRate, price); }
         if(isFinite(boat.maxRate) && boat.maxRate!==null && boat.maxRate>0){ price = Math.min(boat.maxRate, price); }
@@ -410,6 +407,8 @@
   }
 
   let weekOffset=0;
+  // Booking UI state
+  const state={ selection:null, sheetOpen:false, booking:{ paymentMethod:'cash', total:0, prepay:0, guests:1, contact:'', language:'', note:'' } };
 
   async function render(){
     const cfg=await loadConfig();
@@ -471,13 +470,14 @@
           if(cfg.clientUid) extra.uid = cfg.clientUid;
           if(cfg.userId) extra.user = cfg.userId;
           if(cfg.userAgent) extra.ua = cfg.userAgent;
-          const url = makeUrl(baseCombined, { start:startYMD, end:endYMD, tz:TZ, mode:'combined', client:'viewer', ...extra });
+          // include user in cache key to avoid cross-user pricing cache
+          const url = makeUrl(baseCombined, { start:startYMD, end:endYMD, tz:TZ, mode:'combined', client:'viewer', user: (cfg.userId||undefined), uid:(cfg.clientUid||undefined), ...extra });
           const useJsonp = shouldUseJsonp(baseCombined);
           log('fetch url', url, 'mode', useJsonp? 'jsonp':'fetch');
           data = useJsonp ? await fetchJsonp(url) : await fetchJson(url);
-          cacheSet(key, data);
+          cacheSet(key + (cfg.userId? `|u:${cfg.userId}`:''), data);
         }catch(err){
-          const cachedAny = cacheGet(key, Infinity);
+          const cachedAny = cacheGet(key, Infinity) || cacheGet(key + (cfg.userId? `|u:${cfg.userId}`:''), Infinity);
           if(cachedAny){ data=cachedAny; usedCache=true; }
           else { log('load failed', err); renderError('Load failed', String(err&&err.message||err)); return; }
         }
@@ -501,7 +501,6 @@
     const closeHM = useSheetCfg ? (pricing.close || cfg.close || '24:00') : (cfg.close || pricing.close || '24:00');
     const slotMins = Number(useSheetCfg ? (pricing.slotMins || cfg.slotMins || 60) : (cfg.slotMins || pricing.slotMins || 60));
 
-    // Merge UI/debug flags from sheet config if provided
     if(useSheetCfg && typeof pricing.showBusyDebug !== 'undefined') cfg.showBusyDebug = !!pricing.showBusyDebug;
     if(useSheetCfg && typeof pricing.occupancyMode === 'string'){
       cfg.occupancyMode = pricing.occupancyMode;
@@ -531,7 +530,6 @@
 
     const dayList = Array.from({length:7},(_,i)=> addDays(rangeStartInTz,i));
     const dayYMD = dayList.map(d=> isoDateInTZ(d, TZ));
-    // Specials map from backend (may be undefined)
     const specials = pricing.specialDates || {};
     function getDayHours(ymd){
       const spec = specials && specials[ymd];
@@ -543,23 +541,34 @@
       }
       return { open: openHM, close: closeHM };
     }
+    // Grid hours: by default show full day (off-hours allowed),
+    // but if Special_DT defines a time window for this day, respect it.
+    function getGridHours(ymd){
+      // Simple original hours logic: prefer overlay window on the date, else any item
+      // with start/end; otherwise use default open/close.
+      const spec = specials && specials[ymd];
+      if(spec && Array.isArray(spec.items)){
+        const overlay = spec.items.find(it=> String(it.type||'').toLowerCase()==='overlay' && (it.start || it.end));
+        const any = spec.items.find(it=> (it.start || it.end));
+        const pick = overlay || any;
+        if(pick){ return { open: pick.start || openHM, close: pick.end || closeHM }; }
+      }
+      return { open: openHM, close: closeHM };
+    }
 
-    // Occupancy window selection
-    const occMode = (cfg.occupancyMode||'week'); // 'day' | 'around' | 'week'
+    const occMode = (cfg.occupancyMode||'week');
     const aroundDays = Number(cfg.occupancyAroundDays||1);
     const occWeek = computeOccupancy(boats, dayYMD, getDayHours);
     const occByDay = new Array(7);
     for(let i=0;i<7;i++){
       if(occMode==='week') { occByDay[i] = occWeek; continue; }
       if(occMode==='day') { occByDay[i] = computeOccupancy(boats, [dayYMD[i]], getDayHours); continue; }
-      // around ±N days (clamped to the week)
       const start = Math.max(0, i - aroundDays);
       const end = Math.min(6, i + aroundDays);
       const slice = dayYMD.slice(start, end+1);
       occByDay[i] = computeOccupancy(boats, slice, getDayHours);
     }
 
-    // If user policy says 'normal', force horizon=0 (fixed occupancy multiplier)
     if(cfg.pricingMethod === 'normal'){
       cfg.occupancyHorizonDays = 0;
     }
@@ -593,16 +602,14 @@
 
     function HourlyDay(dayYMD){
       const rows=[];
-      const dayHours = getDayHours(dayYMD);
+      const dayHours = getGridHours(dayYMD);
       const openM = hmToMinutes(dayHours.open);
       const closeMRaw = hmToMinutes(dayHours.close);
       const step=slotMins;
       const totalMinutes = minutesDiffWrap(openM, closeMRaw);
-      let minutesCursor = openM;
       let steps = Math.ceil(totalMinutes/step);
       for(let n=0;n<steps;n++){
         const minuteValue = (openM + n*step) % (24*60);
-        const nextMinuteValue = (minuteValue + step) % (24*60);
         const slotStart = dateAtMinutes(dayYMD, minuteValue);
         let slotEnd = new Date(slotStart.getTime() + step*60000);
         const h12=((Math.floor(minuteValue/60)+11)%12)+1;
@@ -617,7 +624,7 @@
         const minsNow = minuteValue;
         const isNow = isTodayDubai && (minsNow <= nowMinutes) && (nowMinutes < minsNow + step);
         const inSun = sunsetsMap ? inSunsetWindow(slotStart) : false;
-        rows.push({label: labelCore, cells, sunset: inSun, now: isNow});
+        rows.push({minute: minuteValue, label: labelCore, cells, sunset: inSun, now: isNow});
       }
       return rows;
     }
@@ -627,25 +634,21 @@
       const isToday = todayIso === isoDateInTZ(d, TZ);
       let specialsUi='';
       let dbg='';
-      // Visible specials (day name + optional 12h/24h, offers, note)
       try{
         const ymdVis = isoDateInTZ(d, TZ);
         const specVis = (pricing.specialDates||{})[ymdVis];
         if(specVis && Array.isArray(specVis.items) && specVis.items.length){
           const rows=[];
-          // Day name (unique) styled like date, with optional 12h/24h
           const names = Array.from(new Set(specVis.items.map(it=> String(it.name||'').trim()).filter(Boolean)));
           const dayName = names.join(', ');
           const first12 = specVis.items.find(it=> it.p12h && isFinite(it.p12h));
           const first24 = specVis.items.find(it=> it.p24h && isFinite(it.p24h));
           const badgeKind = first24? '24h' : (first12? '12h' : '');
           const badgeAmount = first24? Number(first24.p24h) : (first12? Number(first12.p12h) : null);
-          // Row 1: day name centered, tidy line-height for wraps
           if(dayName){
             const sizeCls = (window.innerWidth<420? 'text-xl' : 'text-base');
             rows.push(`<div class=\"mt-1 text-center\"><span class=\"${sizeCls} font-semibold text-violet-700\" style=\"line-height:1.2\">${dayName}</span></div>`);
           }
-          // Row 2: price badge aligned to the right (or omitted)
           if(badgeKind && badgeAmount!==null){
             const badge = `<div class=\"inline-flex items-center rounded-full bg-gray-100 text-gray-700 px-3 py-1 text-[11px] font-medium whitespace-nowrap leading-none\">${badgeKind} ${badgeAmount.toLocaleString('en')} AED</div>`;
             rows.push(`<div class=\"mt-1 flex justify-end\">${badge}</div>`);
@@ -653,11 +656,9 @@
           const offers = specVis.items.filter(it=> String(it.type||'').toLowerCase()!=='overlay');
           offers.slice(0,3).forEach(it=>{
             const boatLbl = it.boat? (boatsCfgById.get(it.boat)?.name || it.boat) : '';
-            const p12 = '';
-            const p24 = '';
             const min = (it.minOrder && isFinite(it.minOrder))? (`min ${it.minOrder}h`) : '';
             const title=[it.name||'Offer', boatLbl].filter(Boolean).join(' • ');
-            const line=[p12,p24,min].filter(Boolean).join(' • ');
+            const line=[min].filter(Boolean).join(' • ');
             rows.push(`<div class=\"px-2 py-1 rounded-lg bg-emerald-50 text-emerald-800 text-[11px] text-center\">${title}${line? ' — '+line : ''}</div>`);
           });
           const noteItem = specVis.items.find(it=> (it.note && String(it.note).trim().length>0));
@@ -679,7 +680,6 @@
           (boats||[]).forEach(b=>{
             const o = occ && occ[b.id];
             const r = (o && typeof o.ratio==='number') ? Math.round(o.ratio*100) : null;
-            // busy multiplier (consider horizon rules)
             let busyM = 1; let busyTag='busy';
             if(Number.isFinite(horizon)){
               try{
@@ -696,9 +696,8 @@
               const info = resolveBusyInfo(pricing.busyLevels||[], o? o.ratio : null, b.id);
               busyM = (info && Number.isFinite(info.mult))? Number(info.mult) : 1;
             }
-            // dow multiplier for this day
-          const dowRaw = resolveDowMultiplier(dowMap, dowKey, b.id);
-          const dowM = (typeof cfg.dowMinOcc === 'number' && !(o && (o.ratio>=cfg.dowMinOcc))) ? 1 : dowRaw;
+            const dowRaw = resolveDowMultiplier(dowMap, dowKey, b.id);
+            const dowM = (typeof cfg.dowMinOcc === 'number' && !(o && (o.ratio>=cfg.dowMinOcc))) ? 1 : dowRaw;
             const total = busyM * dowM;
             const occStr = (r!==null? (r+'%') : '—');
             const pieces = [];
@@ -707,7 +706,6 @@
             pieces.push(`= ×${total.toFixed(2)}`);
             parts.push(`${b.name||b.id}: ${pieces.join(' • ')}`);
           });
-          // Pricing type: dynamic (within horizon) or normal (beyond)
           let typeLabel = 'динамический';
           if(Number.isFinite(horizon)){
             try{
@@ -721,8 +719,6 @@
               }
             }catch{}
           }
-          // special offers/overlays summary for the day
-          // reuse ymd computed above
           const spec = (pricing.specialDates||{})[ymd];
           let specStr = '';
           if(spec && Array.isArray(spec.items) && spec.items.length){
@@ -778,14 +774,257 @@
                 ${r.now? '<div style=\"width:6px; height:6px; background:#3b82f6; border-radius:9999px; box-shadow:0 0 0 2px rgba(255,255,255,0.85)\"></div>' : ''}
               </div>
               <div class="${isSmall?'text-base':'text-sm'} text-gray-700 tn-nums text-right ${isSmall?'pr-2':'pr-3'} flex items-center justify-end" style="height:${rowH}px;">${r.label}</div>
-              ${r.cells.map(c=> c.status==='free' ? `<div class=\"w-full rounded-lg bg-green-100 text-green-900 ${isSmall?'text-[11px]':'text-xs'} flex items-center justify-center\" style=\"height:${rowH}px\">${c.price ?? '—'} AED</div>` : (c.status==='busy'? `<div class=\"w-full rounded-lg bg-red-300/80 text-[11px] text-red-900 flex items-center justify-center\" style=\"height:${rowH}px\">Busy</div>` : `<div class=\"w-full ${isSmall?'text-[11px]':'text-xs'} text-gray-300 flex items-center justify-center\" style=\"height:${rowH}px\">—</div>`)).join('')}
+              ${r.cells.map(c=> {
+                const isSel = state.selection && state.selection.ymd===ymd && state.selection.boatId===c.id && r.minute>=state.selection.startMinute && r.minute < (state.selection.startMinute + state.selection.duration);
+                if(c.status==='free'){
+                  const cls = `w-full rounded-lg ${isSel? 'bg-indigo-50 slot-selected':'bg-green-100'} text-green-900 ${isSmall?'text-[11px]':'text-xs'} flex items-center justify-center cursor-pointer`;
+                  const label = `${c.price ?? '—'} AED`;
+                  return `<div class=\"${cls}\" data-boat=\"${c.id}\" data-ymd=\"${ymd}\" data-minute=\"${r.minute}\" style=\"height:${rowH}px\">${label}</div>`;
+                }
+                if(c.status==='busy') return `<div class=\"w-full rounded-lg bg-red-300/80 text-[11px] text-red-900 flex items-center justify-center\" style=\"height:${rowH}px\">Busy</div>`;
+                return `<div class=\"w-full ${isSmall?'text-[11px]':'text-xs'} text-gray-300 flex items-center justify-center\" style=\"height:${rowH}px\">—</div>`;
+              }).join('')}
             `).join('')}
           </div>
         </div>`;
     }).join('');
 
-    app.innerHTML = header + `<div class="mx-auto ${isSmall?'max-w-sm':'max-w-4xl'}">` + content + `</div>`;
+    app.innerHTML = header + `<div class="mx-auto ${isSmall?'max-w-sm':'max-w-4xl'}">` + content + `</div>` + `<div id="sheet"></div>` + `<div id="fab"></div>`;
+
+    // Selection handlers
+    app.querySelectorAll('[data-boat]').forEach(el=>{
+      el.addEventListener('click',()=>{
+        const boatId=el.getAttribute('data-boat'); const ymd=el.getAttribute('data-ymd'); const minute=Number(el.getAttribute('data-minute')||0);
+        const step=slotMins;
+        const remain = Math.max(step, (24*60 - minute));
+        const desired = step*2;
+        let duration = Math.max(step, Math.floor(Math.min(desired, remain)/step)*step);
+        const boatName = boatsCfgById.get(boatId)?.name || boatId;
+        state.selection={ boatId, boatName, ymd, startMinute:minute, duration, step };
+        state.sheetOpen=false;
+        renderBookingSheet(pricing, boats, priceAt);
+        updateSelectionHighlight();
+        renderFab(pricing, boats, priceAt);
+      });
+    });
+
+    // Render sheet after grid
+    renderBookingSheet(pricing, boats, priceAt);
+    renderFab(pricing, boats, priceAt);
+
+    // expose helpers for sheet controls
+    window.updateSelectionHighlight = updateSelectionHighlight;
+
+    function updateSelectionHighlight(){
+      const sel=state.selection;
+      const nodes=app.querySelectorAll('[data-boat]');
+      if(!sel){
+        // reset all free cells to default look
+        nodes.forEach(n=>{ n.classList.remove('slot-selected','bg-indigo-50'); n.classList.add('bg-green-100'); });
+        return;
+      }
+      const start=sel.startMinute, end=sel.startMinute + sel.duration;
+      nodes.forEach(n=>{
+        const nBoat=n.getAttribute('data-boat');
+        const nYmd=n.getAttribute('data-ymd');
+        const m=Number(n.getAttribute('data-minute')||0);
+        const inSel = (nBoat===sel.boatId) && (nYmd===sel.ymd) && (m>=start && m<end);
+        if(inSel){
+          n.classList.add('slot-selected','bg-indigo-50');
+          n.classList.remove('bg-green-100');
+        } else {
+          n.classList.remove('slot-selected','bg-indigo-50');
+          n.classList.add('bg-green-100');
+        }
+      });
+    }
   }
+
+  function sumSelectedPrice(sel, priceAt){
+    if(!sel) return 0; const {boatId, ymd, startMinute, duration, step}=sel; const slots=Math.ceil(duration/step); let total=0;
+    for(let i=0;i<slots;i++){
+      const m=(startMinute + i*step)%(24*60); const s=dateAtMinutes(ymd, m); const v=priceAt(boatId, s); if(!isFinite(v)) return 0; total+=Number(v||0);
+    }
+    return total;
+  }
+
+  // simplified mode: we don't block by busy here; UI still shows Busy, but booking UI ignores it
+
+  function renderBookingSheet(pricing, boats, priceAt){
+    const sheet=document.getElementById('sheet'); if(!sheet) return;
+    const sel=state.selection; const invalidBusy = false;
+    let minDurWarn=''; let invalidMin=false; let minDurMins=0;
+    const invalid = false;
+    let summary='';
+    if(sel){
+      const h=Math.floor(sel.duration/60), m=sel.duration%60; const hStr = h? `${h}h` : ''; const mStr = m? `${m}m` : ''; const durStr = [hStr,mStr].filter(Boolean).join(' ');
+      const total=sumSelectedPrice(sel, priceAt); state.booking.total=total;
+      const dateStr = sel.ymd;
+      summary = `${sel.boatName} • ${dateStr} • ${durStr}`;
+    }
+    const balanceDue = Math.max(0, Number(state.booking.total||0) - Number(state.booking.prepay||0));
+    sheet.innerHTML = `
+      <div class="fixed inset-0 bg-black/30 ${state.sheetOpen? '' : 'hidden'}" id="sheetMask"></div>
+      <div class="fixed left-0 right-0 bottom-0 sheet bg-white rounded-t-2xl shadow-2xl ${state.sheetOpen? 'sheet-open':'sheet-enter'}" id="sheetPanel">
+        <div class="p-4 border-b flex items-center justify-between">
+          <div class="font-semibold">Booking</div>
+          <button class="px-3 py-1 rounded-lg bg-gray-100" id="btnClose">Close</button>
+        </div>
+        <div class="p-4">
+          <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <div class="text-sm text-gray-700">${summary || 'No selection'}</div>
+            <div class="flex items-center gap-2">
+              <button class="px-2 py-1 rounded-lg bg-gray-100" id="btnShiftLeft">-30m</button>
+              <button class="px-2 py-1 rounded-lg bg-gray-100" id="btnMinus">-</button>
+              <div class="px-3 py-1 rounded-lg bg-gray-50 tn-nums" id="durLbl"></div>
+              <button class="px-2 py-1 rounded-lg bg-gray-100" id="btnPlus">+</button>
+              <button class="px-2 py-1 rounded-lg bg-gray-100" id="btnShiftRight">+30m</button>
+            </div>
+          </div>
+          
+
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div class="bg-gray-50 rounded-xl p-3">
+              <div class="font-medium mb-2">Payments</div>
+              <label class="block text-sm mb-2">Payment method
+                <select class="mt-1 w-full border rounded-lg p-2" id="payMethod">
+                  <option value="cash">Cash</option>
+                  <option value="account">Account</option>
+                  <option value="stripe">Stripe</option>
+                </select>
+              </label>
+              <div class="text-sm mb-2">Total amount: <span class="font-semibold tn-nums" id="totalAmt">${(state.booking.total||0).toLocaleString('en')} AED</span></div>
+              <label class="block text-sm mb-2">Prepayment
+                <input type="number" min="0" step="50" class="mt-1 w-full border rounded-lg p-2 tn-nums" id="prepay" value="${Number(state.booking.prepay||0)}" />
+              </label>
+              <div class="text-sm">Balance due on board: <span class="font-semibold tn-nums" id="balance">${balanceDue.toLocaleString('en')} AED</span></div>
+            </div>
+
+            <div class="bg-gray-50 rounded-xl p-3">
+              <div class="font-medium mb-2">Guest</div>
+              <label class="block text-sm mb-2">Number of guests
+                <input type="number" min="1" max="50" class="mt-1 w-full border rounded-lg p-2" id="guests" value="${Number(state.booking.guests||1)}" />
+              </label>
+              <label class="block text-sm mb-2">Guest contact
+                <input type="text" placeholder="Phone / Email" class="mt-1 w-full border rounded-lg p-2" id="contact" value="${state.booking.contact||''}" />
+              </label>
+              <label class="block text-sm mb-2">Trip language
+                <input type="text" class="mt-1 w-full border rounded-lg p-2" id="lang" value="${state.booking.language||''}" />
+              </label>
+            </div>
+
+            <div class="bg-gray-50 rounded-xl p-3">
+              <div class="font-medium mb-2">Additional</div>
+              <label class="block text-sm mb-2">Custom note
+                <textarea rows="5" class="mt-1 w-full border rounded-lg p-2" id="note">${state.booking.note||''}</textarea>
+              </label>
+            </div>
+          </div>
+
+          <div class="mt-4 flex justify-end gap-2">
+            <button class="px-4 py-2 rounded-lg bg-white border" id="btnDiscard">Discard</button>
+            <button class="px-4 py-2 rounded-lg bg-indigo-600 text-white disabled:opacity-50" id="btnSubmit" ${invalid? 'disabled':''}>Book</button>
+          </div>
+        </div>
+      </div>`;
+
+    const durLbl=document.getElementById('durLbl'); if(durLbl && sel){ const h=Math.floor(sel.duration/60), m=sel.duration%60; durLbl.textContent = `${h? h+'h ':''}${m? m+'m':''}` || '0m'; }
+    const mask=document.getElementById('sheetMask'); const close=document.getElementById('btnClose'); const discard=document.getElementById('btnDiscard');
+    function closeSheet(){ state.sheetOpen=false; renderBookingSheet(pricing, boats, priceAt); renderFab(pricing, boats, priceAt); }
+    mask&&mask.addEventListener('click', closeSheet); close&&close.addEventListener('click', closeSheet); discard&&discard.addEventListener('click', ()=>{ state.selection=null; closeSheet(); render(); });
+    const plus=document.getElementById('btnPlus'); const minus=document.getElementById('btnMinus'); const shL=document.getElementById('btnShiftLeft'); const shR=document.getElementById('btnShiftRight');
+    function adjustDur(delta){
+      if(!state.selection) return;
+      const step=state.selection.step;
+      let next = Math.max(step, state.selection.duration + delta);
+      const remain = Math.max(step, (24*60 - state.selection.startMinute));
+      if(next > remain) next = remain;
+      state.selection.duration = next;
+      updateSelectionHighlight(); renderBookingSheet(pricing, boats, priceAt); renderFab(pricing, boats, priceAt);
+    }
+    function shiftBy(delta){
+      if(!state.selection) return;
+      const step=state.selection.step;
+      const newStart = ((state.selection.startMinute + delta)%(24*60)+24*60)%(24*60);
+      const remain = Math.max(step, (24*60 - newStart));
+      if(state.selection.duration > remain){ state.selection.duration = remain; }
+      state.selection.startMinute = newStart;
+      updateSelectionHighlight(); renderBookingSheet(pricing, boats, priceAt); renderFab(pricing, boats, priceAt);
+    }
+    plus&&plus.addEventListener('click', ()=>adjustDur(state.selection? state.selection.step:60));
+    minus&&minus.addEventListener('click', ()=>adjustDur(-(state.selection? state.selection.step:60)));
+    shL&&shL.addEventListener('click', ()=>shiftBy(-30)); shR&&shR.addEventListener('click', ()=>shiftBy(30));
+    const prepay=document.getElementById('prepay'); prepay&&prepay.addEventListener('input',()=>{ state.booking.prepay = Number(prepay.value||0); renderBookingSheet(pricing, boats, priceAt); });
+    const pm=document.getElementById('payMethod'); pm&&pm.addEventListener('change',()=>{ state.booking.paymentMethod=pm.value; });
+    const guests=document.getElementById('guests'); guests&&guests.addEventListener('input',()=>{ state.booking.guests=Number(guests.value||1); });
+    const contact=document.getElementById('contact'); contact&&contact.addEventListener('input',()=>{ state.booking.contact=contact.value; });
+    const lang=document.getElementById('lang'); lang&&lang.addEventListener('input',()=>{ state.booking.language=lang.value; });
+    const note=document.getElementById('note'); note&&note.addEventListener('input',()=>{ state.booking.note=note.value; });
+    const submit=document.getElementById('btnSubmit'); submit&&submit.addEventListener('click',()=>{
+      const payload={
+        when: new Date().toISOString(),
+        selection: state.selection,
+        pricingInfo: { total: state.booking.total },
+        payment: { method: state.booking.paymentMethod, prepay: Number(state.booking.prepay||0), balance: Math.max(0, Number(state.booking.total||0)-Number(state.booking.prepay||0)) },
+        guest: { count: Number(state.booking.guests||1), contact: state.booking.contact||'', language: state.booking.language||'' },
+        note: state.booking.note||''
+      };
+      console.log('BOOKING_SUBMIT', payload);
+      alert('Booking payload logged to console. Backend integration TBD.');
+      state.sheetOpen=false; renderBookingSheet(pricing, boats, priceAt); renderFab(pricing, boats, priceAt);
+    });
+    const totalLbl=document.getElementById('totalAmt'); if(totalLbl) totalLbl.textContent = `${(state.booking.total||0).toLocaleString('en')} AED`;
+    const bal=document.getElementById('balance'); if(bal) bal.textContent = `${(Math.max(0, Number(state.booking.total||0)-Number(state.booking.prepay||0))).toLocaleString('en')} AED`;
+  }
+
+  function renderFab(pricing, boats, priceAt){
+    const fab=document.getElementById('fab'); if(!fab) return;
+    const sel=state.selection; if(!sel){ fab.innerHTML=''; return; }
+    const invalid = false;
+    const total = sumSelectedPrice(sel, priceAt);
+    const h=Math.floor(sel.duration/60), m=sel.duration%60; const durStr=`${h? h+'h ':''}${m? m+'m':''}`.trim()||'0m';
+    fab.innerHTML = `
+      <div class="fixed right-4 bottom-4 flex gap-2 items-center">
+        <button id="fabReset" class="px-3 py-2 rounded-full bg-white border shadow">Reset</button>
+        <button id="fabBook" ${invalid?'disabled':''} class="px-4 py-3 rounded-full shadow-lg ${invalid? 'bg-gray-300 text-gray-600 cursor-not-allowed':'bg-indigo-600 text-white'}">
+          Book • ${durStr} • ${Number(total||0).toLocaleString('en')} AED
+        </button>
+      </div>`;
+    const btn=document.getElementById('fabBook');
+    if(btn && !invalid){ btn.onclick=()=>{ state.sheetOpen=true; renderBookingSheet(pricing, boats, priceAt); }; }
+    const reset=document.getElementById('fabReset');
+    if(reset){ reset.onclick=()=>{ state.selection=null; renderBookingSheet(pricing, boats, priceAt); renderFab(pricing, boats, priceAt); updateSelectionHighlight(); }; }
+  }
+
+  function maxContiguousFreeMinutes(boats, boatId, ymd, startMinute, step){
+    const boat=boats.find(b=> b.id===boatId); if(!boat) return step;
+    const evs=(boat.events||[]);
+    let total=0; let m=startMinute;
+    for(let guard=0; guard<Math.ceil(1440/step); guard++){
+      const s=dateAtMinutes(ymd, m); const e=new Date(s.getTime()+step*60000);
+      if(makeStatus(evs, s, e)!=='free') break;
+      total += step;
+      const nextM = (m + step) % (24*60);
+      // Do not wrap over midnight: stop at the day boundary
+      if(nextM <= m) break;
+      m = nextM;
+    }
+    return Math.max(step, total);
+  }
+
+  // Lightweight toast/notice
+  function showNotice(msg){
+    try{
+      let t=document.getElementById('yc_toast');
+      if(!t){ t=document.createElement('div'); t.id='yc_toast'; document.body.appendChild(t); }
+      t.className='fixed left-1/2 -translate-x-1/2 top-4 z-50';
+      t.innerHTML = `<div class="px-3 py-2 rounded-lg bg-black/80 text-white text-sm shadow">${msg}</div>`;
+      clearTimeout(t._timer);
+      t._timer=setTimeout(()=>{ if(t) t.innerHTML=''; }, 2500);
+    }catch{}
+  }
+
+// simplified mode: minimum duration is controlled only by UI step and day end
 
   async function forceRefresh(){
     const cfg=await loadConfig();
@@ -794,7 +1033,7 @@
     const startYMD = isoDateInTZ(rangeStartInTz, TZ);
     const baseCombined = cfg.pricingEndpointUrl || cfg.endpointUrl;
     const key=`yachtCalendarCache|combined|${baseCombined}|${startYMD}`;
-    try{ localStorage.removeItem(key); }catch{}
+    try{ localStorage.removeItem(key); localStorage.removeItem(key + (cfg.userId? `|u:${cfg.userId}`:'')); }catch{}
     render();
   }
 

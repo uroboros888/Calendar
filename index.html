@@ -657,3 +657,319 @@
   </script>
 </body>
 </html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Yacht Calendar — Viewer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html,body{height:100%}
+    .tn-nums{font-variant-numeric: tabular-nums;}
+  </style>
+</head>
+<body class="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100 text-gray-900">
+  <div id="app" class="mx-auto px-4 py-6 max-w-5xl"></div>
+
+  <script>
+  const STORAGE_KEY='yachtCalendarConfig';
+  const TZ='Asia/Dubai'; // fixed per requirements
+  // Force English locale for month/day names
+  const fmt = (d, opts={}) => new Intl.DateTimeFormat('en', {...opts, timeZone: TZ}).format(d);
+
+  const app=document.getElementById('app');
+
+  // --- Lightweight logging & error surface ---
+  const __logs=[];
+  function log(){ try{ console.log.apply(console, arguments); __logs.push(Array.from(arguments).map(x=> typeof x==='object'? JSON.stringify(x): String(x)).join(' ')); }catch{} }
+  function renderError(title, message){
+    const details = __logs.slice(-30).join('\n');
+    app.innerHTML = `
+      <div class="max-w-md mx-auto text-center bg-white rounded-2xl shadow p-6">
+        <h2 class="font-semibold text-lg mb-2">${title}</h2>
+        <div class="text-sm text-gray-600 whitespace-pre-wrap">${message}</div>
+        <div class="mt-4 flex flex-wrap gap-2 justify-center">
+          <button class="px-3 py-2 rounded-lg bg-indigo-600 text-white" onclick="location.reload()">Retry</button>
+          <a class="px-3 py-2 rounded-lg bg-white border" href="mailto:support@example.com?subject=Yacht%20Calendar%20Support" rel="noopener">Contact Support</a>
+          <button class="px-3 py-2 rounded-lg bg-white border" onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('dbg').innerText)">Copy logs</button>
+        </div>
+        <pre id="dbg" class="text-left mt-3 p-2 bg-gray-50 rounded max-h-64 overflow-auto text-xs">${details}</pre>
+      </div>`;
+  }
+  window.addEventListener('error', (e)=>{ renderError('Runtime error', e.message||'unknown'); });
+  window.addEventListener('unhandledrejection', (e)=>{ renderError('Unhandled promise', String(e.reason||e)); });
+
+  // Load only from config.json
+  async function loadConfig(){
+    if(location.protocol==='file:'){
+      throw new Error('config.json cannot be loaded over file://. Please serve via http(s).');
+    }
+    const res = await fetch('config.json', {cache:'no-store'});
+    if(!res.ok){ throw new Error('Failed to load config.json ('+res.status+')'); }
+    return await res.json();
+  }
+  function pad2(n){ return String(n).padStart(2,'0'); }
+
+  // Build YYYY-MM-DD date in TZ for today + offsetDays
+  function zonedDateParts(date, timeZone){
+    const parts = new Intl.DateTimeFormat('en-CA',{timeZone,year:'numeric',month:'2-digit',day:'2-digit',weekday:'short',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(date);
+    const map={}; parts.forEach(p=> map[p.type]=p.value);
+    return { y: Number(map.year), m: Number(map.month), d: Number(map.day), wd: map.weekday, h: Number(map.hour), mi: Number(map.minute) };
+  }
+  function isoDateInTZ(date, timeZone){ const p=zonedDateParts(date,timeZone); return `${p.y}-${pad2(p.m)}-${pad2(p.d)}`; }
+
+  // We render 7 days starting from "today" in Dubai
+
+  function addDays(d, n){ const x=new Date(d); x.setUTCDate(x.getUTCDate()+n); return x; }
+
+  // Helpers to create Date from a Dubai calendar day + HH:MM (no DST in Dubai, offset +04:00)
+  function dubaiSlotDate(ymd, hm){ return new Date(`${ymd}T${hm}:00+04:00`); }
+  function addMinutes(date, mins){ const d=new Date(date); d.setMinutes(d.getMinutes()+mins); return d; }
+
+  // Demo data generator (deterministic with seed)
+  function random(seed){ return ()=> (seed = (seed*9301 + 49297) % 233280) / 233280; }
+  function demoEventsForWeek(weekStartInTz, seed){
+    const out=[]; const rnd=random(seed);
+    for(let d=0; d<7; d++){
+      const ymd = isoDateInTZ(addDays(weekStartInTz,d), TZ);
+      let cursor = dubaiSlotDate(ymd, '08:00');
+      const dayEnd = dubaiSlotDate(ymd, '23:00');
+      const n = 1 + Math.floor(rnd()*3);
+      for(let i=0;i<n;i++){
+        const startOffset = (Math.floor(rnd()*9))*30; // 0..240m
+        const dur = (2 + Math.floor(rnd()*9))*30; // 60..300m
+        const start = addMinutes(cursor, startOffset);
+        let end = addMinutes(start, dur); if(end>dayEnd) end=dayEnd;
+        cursor = addMinutes(end, (Math.floor(rnd()*5))*30);
+        out.push({start, end});
+      }
+    }
+    return out;
+  }
+
+  function makePriceFn(pr, opts={}){
+    const round=(v)=> pr.roundTo>0? Math.round(v/pr.roundTo)*pr.roundTo : v;
+    const sunsetMap = opts.sunsets || null; // Map YYYY-MM-DD -> {hh, mm}
+    const before = Number(opts.sunsetWindowBefore||0);
+    const after = Number(opts.sunsetWindowAfter||0);
+    const parseHM = (s)=>{ const [hh,mm]=String(s).split(':').map(n=> Number(n||0)); return {hh,mm,mins:hh*60+mm}; };
+    const dateYMD = (d)=> isoDateInTZ(d,TZ);
+
+    function inSunsetWindow(dt){
+      if(!sunsetMap) return false;
+      const ymd=dateYMD(dt);
+      const ss = sunsetMap.get(ymd); if(!ss) return false;
+      const h=dt.getHours(), m=dt.getMinutes(); const mins=h*60+m;
+      return mins >= (ss.mins - before) && mins < (ss.mins + after);
+    }
+
+    function bandMultiplier(dt){
+      let mult;
+      if(inSunsetWindow(dt)) mult = pr.bands.sunset;
+      else {
+        const h=dt.getHours();
+        mult = (h>=8&&h<12)? pr.bands.morning : (h<17? pr.bands.day : (h<20? pr.bands.sunset : pr.bands.evening));
+      }
+      // Friday sunset extra only if inside sunset window (dynamic) or static 17-20 fallback
+      const isFri = dt.getDay()===5;
+      if(isFri && (inSunsetWindow(dt))) mult *= pr.friSunset;
+      return mult;
+    }
+    return (base,dt)=> round(base * bandMultiplier(dt));
+  }
+
+  async function fetchJson(url, timeoutMs=15000){
+    const ctrl=new AbortController(); const t=setTimeout(()=>ctrl.abort(), timeoutMs);
+    try{ const res= await fetch(url,{signal:ctrl.signal}); if(!res.ok) throw new Error(`HTTP ${res.status}`); return await res.json(); }
+    finally{ clearTimeout(t); }
+  }
+
+  // JSONP loader to bypass CORS for Apps Script Web Apps
+  function fetchJsonp(url, timeoutMs=15000){
+    return new Promise((resolve, reject)=>{
+      const cb = `yc_cb_${Date.now()}_${Math.floor(Math.random()*1e6)}`;
+      const sep = url.includes('?') ? '&' : '?';
+      const src = `${url}${sep}callback=${cb}&_=${Date.now()}`; // cache buster
+      const s = document.createElement('script');
+      let done=false;
+      const timer=setTimeout(()=>{ cleanup(); reject(new Error('JSONP timeout')); }, timeoutMs);
+      function cleanup(){ if(done) return; done=true; clearTimeout(timer); delete window[cb]; if(s.parentNode) s.parentNode.removeChild(s); }
+      window[cb] = (data)=>{ cleanup(); resolve(data); };
+      s.onerror = ()=>{ cleanup(); reject(new Error('JSONP load error')); };
+      s.src = src; document.head.appendChild(s);
+    });
+  }
+
+  function cacheGet(key, ttlMs){ try{ const raw=localStorage.getItem(key); if(!raw) return null; const obj=JSON.parse(raw); if(Date.now()-obj.t>ttlMs) return null; return obj.v; }catch{ return null; } }
+  function cacheSet(key, v){ try{ localStorage.setItem(key, JSON.stringify({t:Date.now(), v})); }catch{} }
+
+  let weekOffset=0; // shifts by whole weeks (7 days) from today in Dubai
+
+  async function render(){
+    const cfg=await loadConfig();
+    log('cfg.endpoint', cfg.endpointUrl);
+
+    const baseToday = new Date();
+    const nowP = zonedDateParts(baseToday, TZ);
+    const nowYMD = `${nowP.y}-${pad2(nowP.m)}-${pad2(nowP.d)}`;
+    const nowMinutes = nowP.h*60 + nowP.mi;
+    const rangeStartInTz = addDays(baseToday, 7*weekOffset);
+    const startYMD = isoDateInTZ(rangeStartInTz, TZ);
+    const endYMD = isoDateInTZ(addDays(rangeStartInTz, 6), TZ);
+
+    // Load sunsets if specified
+    let sunsetsMap=null;
+    if(cfg.sunsetFile && location.protocol!=='file:'){
+      try{ const r=await fetch(String(cfg.sunsetFile),{cache:'no-store'}); if(r.ok){ const arr=await r.json(); const m=new Map(); arr.forEach(x=>{ if(x&&x.date&&x.sunset){ const [hh,mm]=String(x.sunset).split(':').map(Number); m.set(String(x.date), {hh,mm,mins:hh*60+mm}); } }); sunsetsMap=m; log('sunsets loaded', m.size); } }
+      catch(err){ log('sunsets load failed', err); }
+    }
+    const priceAt = makePriceFn(cfg.pricing, { sunsets: sunsetsMap, sunsetWindowBefore: cfg.sunsetWindowBefore, sunsetWindowAfter: cfg.sunsetWindowAfter });
+    const isSmall = window.innerWidth < 420;
+    const gridTimeCol = isSmall? 64 : 90; // px
+    const gridLineCol = isSmall? 4 : 8;   // px
+    const gridGap = isSmall? 8 : 12;      // px
+    const rowH = isSmall? 28 : 36;        // px
+
+    const key=`yachtCalendarCache|${cfg.endpointUrl}|${startYMD}`;
+    let data=null; let labelPrefix='';
+    if(cfg.useDemo){
+      // synthesize demo events for boats using seeds
+      const boats = (cfg.boats||[]).map((b,idx)=> ({ id:b.id, name:b.name, events: demoEventsForWeek(rangeStartInTz, idx===0? (cfg.demoSeedA||42) : (cfg.demoSeedB||99)) }));
+      data = { tz: TZ, boats };
+      labelPrefix='demo • ';
+    } else {
+      data = cacheGet(key, 10*60*1000);
+      let usedCache=false;
+      if(!data){
+        app.innerHTML = `<div class="text-center text-sm text-gray-600">Loading ${startYMD}…</div>`;
+        try{
+          const url = `${cfg.endpointUrl}?start=${startYMD}&end=${endYMD}&tz=${encodeURIComponent(TZ)}`;
+          // Use JSONP for Apps Script URLs to avoid CORS on GitHub Pages
+          const useJsonp = /script\.googleusercontent\.com|script\.google\.com/.test(cfg.endpointUrl);
+          log('fetch url', url, 'mode', useJsonp? 'jsonp':'fetch');
+          data = useJsonp ? await fetchJsonp(url) : await fetchJson(url);
+          cacheSet(key, data);
+        }catch(err){
+          const cachedAny = cacheGet(key, Infinity);
+          if(cachedAny){ data=cachedAny; usedCache=true; }
+          else { log('load failed', err); renderError('Load failed', String(err&&err.message||err)); return; }
+        }
+      }
+      labelPrefix = usedCache? 'cached • ' : '';
+    }
+
+    const boatsCfgById = Object.fromEntries(cfg.boats.map(b=> [b.id, b]));
+    const boats = (data.boats || []).filter(b=> boatsCfgById[b.id]);
+
+    function statusFor(events, slotStart, slotEnd){
+      for(const ev of events){ const s=new Date(ev.start), e=new Date(ev.end); if(s < slotEnd && e > slotStart) return 'busy'; }
+      return 'free';
+    }
+
+    // Sunset window helper
+    const sunsetBefore = Number(cfg.sunsetWindowBefore||0);
+    const sunsetAfter  = Number(cfg.sunsetWindowAfter||0);
+    function inSunsetWindow(dt){
+      if(!sunsetsMap) return false;
+      const ymd = isoDateInTZ(dt, TZ);
+      const ss = sunsetsMap.get(ymd); if(!ss) return false;
+      const mins = dt.getHours()*60 + dt.getMinutes();
+      return mins >= (ss.mins - sunsetBefore) && mins < (ss.mins + sunsetAfter);
+    }
+
+    function HourlyDay(dayYMD){
+      const rows=[]; // {label, cells, sunset}
+      const {open, close, slotMins}=cfg;
+      const [oh,om]=open.split(':').map(Number); const [ch,cm]=close.split(':').map(Number);
+      const openM=oh*60+om, closeM=ch*60+cm, step=slotMins;
+      // Sunset boundaries in minutes
+      let ss=null, ssStart=null, ssEnd=null;
+      if(sunsetsMap){ ss = sunsetsMap.get(dayYMD); if(ss){ ssStart = ss.mins - sunsetBefore; ssEnd = ss.mins + sunsetAfter; } }
+      const isTodayDubai = (dayYMD===nowYMD);
+      for(let m=openM; m+step<=closeM; m+=step){
+        const hh=Math.floor(m/60), mm=m%60; const nextH=Math.floor((m+step)/60), nextM=(m+step)%60;
+        const h12=((hh+11)%12)+1; const ap = hh<12 ? 'AM':'PM';
+        const labelCore = mm===0 ? `${h12} ${ap}` : `${h12}:${String(mm).padStart(2,'0')} ${ap}`;
+        const slotStart=dubaiSlotDate(dayYMD, `${pad2(hh)}:${pad2(mm)}`);
+        const slotEnd=addMinutes(slotStart, step);
+        const cells = boats.map(b=>{
+          const st = statusFor(b.events||[], slotStart, slotEnd);
+          const base = boatsCfgById[b.id].baseRate;
+          const price = st==='free'? priceAt(base, slotStart) : null;
+          return {id:b.id, status: st, price};
+        });
+        const inSun = ss ? (m < ssEnd && (m+step) > ssStart) : false;
+        const isNow = isTodayDubai && (m <= nowMinutes) && (nowMinutes < m+step);
+        rows.push({label: labelCore, cells, sunset: inSun, now: isNow});
+      }
+      return rows;
+    }
+
+    const dayList = Array.from({length:7},(_,i)=> addDays(rangeStartInTz,i));
+    const dayYMD = dayList.map(d=> isoDateInTZ(d, TZ));
+
+    function DayHeader(d){ const isToday = new Intl.DateTimeFormat('en-CA',{timeZone:TZ,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date())===isoDateInTZ(d,TZ); return `<div class="${isSmall? 'text-xl' : 'text-base'} font-semibold ${isToday? 'text-blue-700':'text-gray-700'}">${fmt(d,{weekday:'short'})} <span class="opacity-70">${fmt(d,{day:'2-digit',month:'short'})}</span></div>`; }
+
+    const weekEnd = addDays(rangeStartInTz,6);
+    const header = `
+      <div class="flex flex-col items-center gap-2 mb-4 text-center">
+        <h1 class="font-semibold tracking-tight text-2xl">Imperial Yachting</h1>
+        <p class="text-sm text-gray-600">Intervals • ${labelPrefix}${fmt(rangeStartInTz,{month:'short',day:'2-digit'})} — ${fmt(weekEnd,{month:'short',day:'2-digit'})} • ${TZ}</p>
+        <div class="flex items-center gap-2">
+          <button class="px-3 py-2 rounded-xl bg-white shadow" onclick="weekOffset--; render()">←</button>
+          <button class="px-3 py-2 rounded-xl bg-white shadow" onclick="weekOffset++; render()">→</button>
+          <button class="px-3 py-2 rounded-xl bg-indigo-600 text-white shadow" onclick="forceRefresh()">Refresh</button>
+        </div>
+      </div>`;
+
+    const content = dayYMD.map((ymd,i)=>{
+      const rows = HourlyDay(ymd);
+      const boatNames = boats.map(b=> boatsCfgById[b.id].name || b.id);
+      return `
+        <div class="bg-white rounded-2xl shadow p-3 mb-3">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2">${DayHeader(dayList[i])}</div>
+          </div>
+          <div class="grid" style="grid-template-columns:${gridLineCol}px ${gridTimeCol}px 1fr 1fr; gap:${gridGap}px; align-items:center; grid-auto-rows:auto;">
+            <div></div><div></div>
+            ${boatNames.map(n=> `<div class=\"${isSmall?'text-sm':'text-sm'} font-semibold text-gray-700 text-center pb-1\">${n}</div>`).join('')}
+            ${rows.map(r=> `
+              <div style="height:${rowH}px; position:relative; display:flex; align-items:center; justify-content:center;">
+                ${r.sunset? `<div style=\"position:absolute; width:${isSmall?2:3}px; height:100%; background:#f59e0b; border-radius:9999px\"></div>` : ''}
+                ${r.now? '<div style=\"width:6px; height:6px; background:#3b82f6; border-radius:9999px; box-shadow:0 0 0 2px rgba(255,255,255,0.85)\"></div>' : ''}
+              </div>
+              <div class="${isSmall?'text-base':'text-sm'} text-gray-700 tn-nums text-right ${isSmall?'pr-2':'pr-3'} flex items-center justify-end" style="height:${rowH}px;">${r.label}</div>
+              ${r.cells.map(c=> c.status==='free' ? `<div class=\"w-full rounded-lg bg-green-100 text-green-900 ${isSmall?'text-[11px]':'text-xs'} flex items-center justify-center\" style=\"height:${rowH}px\">${c.price} AED</div>` : (c.status==='busy'? `<div class=\"w-full rounded-lg bg-red-300/80 text-[11px] text-red-900 flex items-center justify-center\" style=\"height:${rowH}px\">Busy</div>` : `<div class=\"w-full ${isSmall?'text-[11px]':'text-xs'} text-gray-300 flex items-center justify-center\" style=\"height:${rowH}px\">—</div>`)).join('')}
+            `).join('')}
+          </div>
+        </div>`;
+    }).join('');
+
+    app.innerHTML = header + `<div class="mx-auto ${isSmall?'max-w-sm':'max-w-4xl'}">` + content + `</div>`;
+  }
+
+  async function forceRefresh(){
+    const cfg=await loadConfig();
+    const baseToday=new Date();
+    const rangeStartInTz = addDays(baseToday, 7*weekOffset);
+    const startYMD = isoDateInTZ(rangeStartInTz, TZ);
+    const key=`yachtCalendarCache|${cfg.endpointUrl}|${startYMD}`;
+    try{ localStorage.removeItem(key); }catch{}
+    render();
+  }
+
+  window.useDefaults = function(){
+    try{
+      const raw = localStorage.getItem(STORAGE_KEY);
+      const obj = raw? JSON.parse(raw) : {};
+      obj.endpointUrl = DEFAULT_ENDPOINT;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
+    }catch{}
+    location.reload();
+  };
+
+  render();
+  </script>
+</body>
+</html>
